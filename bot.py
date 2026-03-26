@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Updates Bot — Private relay chat between two people.
+Updates Bot — Private relay chat: admin (@vosidjonn) ↔ approved user (@farangis_f23)
+No database or file storage needed — everything runs in memory.
 """
 
-import json
-import os
-import random
-import string
+import html
 import logging
+import os
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -22,408 +22,363 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     filters,
     ContextTypes,
 )
 
 load_dotenv()
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = "data.json"
+TOKEN            = os.getenv("BOT_TOKEN")
+ADMIN_USERNAME   = os.getenv("ADMIN_USERNAME", "vosidjonn").lstrip("@").lower()
+ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "farangis_f23").lstrip("@").lower()
 
-# Conversation state
-ENTER_CODE = 1
+# In-memory state (resets on bot restart — admin just clicks Approve once)
+state = {
+    "admin_id":   None,   # filled when @vosidjonn sends /start
+    "allowed_id": None,   # filled when @farangis_f23 sends /start
+    "approved":   False,  # set to True when admin approves
+}
 
-# Quick reply templates: (button label, message text)
 QUICK_REPLIES = [
-    ("👍 Got it!", "Got it!"),
-    ("🕐 Running late", "I'm running a bit late, sorry!"),
-    ("🚗 On my way", "On my way!"),
-    ("📞 Call me", "Can you give me a call?"),
-    ("💬 Let's talk", "Can we talk when you're free?"),
-    ("✅ Done!", "Done! All finished."),
+    ("👍 Got it!",       "Got it!"),
+    ("🕐 Running late",  "I'm running a bit late, sorry!"),
+    ("🚗 On my way",     "On my way!"),
+    ("📞 Call me",       "Can you give me a call?"),
+    ("💬 Let's talk",    "Can we talk when you're free?"),
+    ("✅ Done!",         "Done! All finished."),
     ("❌ Can't make it", "Sorry, I can't make it."),
-    ("🔜 BRB", "Be right back!"),
-    ("🌙 Good night", "Good night! Talk tomorrow."),
-    ("☀️ Good morning", "Good morning!"),
-    ("❤️ Miss you", "Missing you ❤️"),
-    ("🎯 On it", "On it, leave it to me!"),
+    ("🔜 BRB",           "Be right back!"),
+    ("🌙 Good night",    "Good night! Talk tomorrow."),
+    ("☀️ Good morning",  "Good morning!"),
+    ("❤️ Miss you",      "Missing you ❤️"),
+    ("🎯 On it",         "On it, leave it to me!"),
+    ("🏠 At Home",       "I'm at home!"),
 ]
 
-
-# ── Storage ──────────────────────────────────────────────────────────────────
-
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {"pairs": {}, "pending_codes": {}}
+TASHKENT = timezone(timedelta(hours=5))
 
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def e(text: str) -> str:
+    return html.escape(str(text))
+
+def fmt_time(dt: datetime) -> str:
+    local = dt.astimezone(TASHKENT)
+    now   = datetime.now(TASHKENT)
+    if local.date() == now.date():
+        return f"<i>⏱ {local.strftime('%H:%M')}</i>"
+    return f"<i>⏱ {local.strftime('%d %b %H:%M')}</i>"
+
+def fmt_quote(reply_msg) -> str:
+    if not reply_msg:
+        return ""
+    if reply_msg.text:
+        p = e(reply_msg.text[:60] + ("…" if len(reply_msg.text) > 60 else ""))
+    elif reply_msg.photo:       p = "📷 Photo"
+    elif reply_msg.voice:       p = "🎤 Voice"
+    elif reply_msg.video:       p = "🎥 Video"
+    elif reply_msg.video_note:  p = "🎥 Video note"
+    elif reply_msg.document:    p = "📎 File"
+    elif reply_msg.sticker:     p = f"{reply_msg.sticker.emoji} Sticker" if reply_msg.sticker.emoji else "Sticker"
+    elif reply_msg.audio:       p = "🎵 Audio"
+    elif reply_msg.location:    p = "📍 Location"
+    else:                       p = "Message"
+    return f"┊ <i>{p}</i>\n"
+
+def username_of(user) -> str:
+    return (user.username or "").lower()
+
+def is_admin(user)   -> bool: return username_of(user) == ADMIN_USERNAME
+def is_allowed(user) -> bool: return username_of(user) == ALLOWED_USERNAME
+def is_auth(user)    -> bool: return is_admin(user) or is_allowed(user)
+
+def register(user):
+    if is_admin(user)   and not state["admin_id"]:
+        state["admin_id"]   = user.id
+    if is_allowed(user) and not state["allowed_id"]:
+        state["allowed_id"] = user.id
+
+def main_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton("📊 Status"), KeyboardButton("❓ Help")]]
+    btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
+    for i in range(0, len(btns), 2):
+        rows.append(btns[i:i+2])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def approve_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"deny_{uid}"),
+    ]])
 
 
-def get_partner_id(user_id: str, data: dict) -> str | None:
-    return data["pairs"].get(str(user_id))
-
-
-# ── Keyboards ─────────────────────────────────────────────────────────────────
-
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("⚡ Quick Replies"), KeyboardButton("📊 Status")],
-         [KeyboardButton("❓ Help")]],
-        resize_keyboard=True,
-    )
-
-
-def quick_replies_inline() -> InlineKeyboardMarkup:
-    buttons, row = [], []
-    for i, (label, _) in enumerate(QUICK_REPLIES):
-        row.append(InlineKeyboardButton(label, callback_data=f"qr_{i}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="qr_cancel")])
-    return InlineKeyboardMarkup(buttons)
-
-
-# ── /start ────────────────────────────────────────────────────────────────────
+# ── /start ─────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = load_data()
+    user = update.effective_user
+    if not is_auth(user):
+        await update.message.reply_text("⛔ You are not authorised to use this bot.")
+        return
 
-    if get_partner_id(user_id, data):
+    register(user)
+
+    if is_admin(user):
         await update.message.reply_text(
-            "✅ You're already connected!\n\nJust send a message to chat.",
-            reply_markup=main_keyboard(),
+            f"👑 <b>Welcome, admin!</b>\n\n"
+            f"Commands:\n"
+            f"/approve — Approve @{ALLOWED_USERNAME}\n"
+            f"/revoke  — Revoke access\n"
+            f"/status  — See current state\n\n"
+            f"Just type to chat.",
+            parse_mode="HTML", reply_markup=main_kb(),
         )
         return
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔑 Generate pairing code", callback_data="gen_code")],
-        [InlineKeyboardButton("🔗 Enter pairing code", callback_data="enter_code")],
-    ])
-    await update.message.reply_text(
-        "👋 *Welcome to Updates!*\n\n"
-        "This is a private channel between you and one other person.\n\n"
-        "To get started:\n"
-        "• *Generate a code* — share it with your partner\n"
-        "• *Enter a code* — if your partner already generated one",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-
-
-# ── Pairing ───────────────────────────────────────────────────────────────────
-
-async def handle_gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = str(query.from_user.id)
-    data = load_data()
-
-    if get_partner_id(user_id, data):
-        await query.edit_message_text("✅ You're already paired!")
+    # Allowed user
+    if state["approved"]:
+        await update.message.reply_text("✅ You're approved! Just send a message.", reply_markup=main_kb())
         return
 
-    # Remove any previous pending code from this user
-    data["pending_codes"] = {
-        c: u for c, u in data["pending_codes"].items() if u != user_id
-    }
-
-    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-    data["pending_codes"][code] = user_id
-    save_data(data)
-
-    await query.edit_message_text(
-        f"🔑 *Your pairing code:*\n\n`{code}`\n\n"
-        "Share this with your partner. It expires once used.\n\n"
-        "_Waiting for your partner to connect..._",
-        parse_mode="Markdown",
-    )
-
-
-async def handle_enter_code_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🔗 Type the 6-character pairing code your partner shared with you:"
-    )
-    return ENTER_CODE
-
-
-async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    code = update.message.text.strip().upper()
-    data = load_data()
-
-    if code not in data["pending_codes"]:
+    admin_id = state["admin_id"]
+    if not admin_id:
         await update.message.reply_text(
-            "❌ Invalid or expired code. Check the code and try again, "
-            "or ask your partner to generate a new one."
-        )
-        return ENTER_CODE
-
-    partner_id = data["pending_codes"][code]
-
-    if partner_id == user_id:
-        await update.message.reply_text("❌ You can't pair with yourself!")
-        return ENTER_CODE
-
-    data["pairs"][user_id] = partner_id
-    data["pairs"][partner_id] = user_id
-    del data["pending_codes"][code]
-    save_data(data)
-
-    await update.message.reply_text(
-        "✅ *Connected!*\n\nYou're now paired. Start chatting!",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-    await context.bot.send_message(
-        chat_id=int(partner_id),
-        text="✅ *Connected!*\n\nYour partner has joined. Start chatting!",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
-    )
-    return ConversationHandler.END
-
-
-# ── Message relay ─────────────────────────────────────────────────────────────
-
-async def relay_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = load_data()
-
-    # Keyboard shortcut buttons
-    text = update.message.text if update.message.text else ""
-    if text == "⚡ Quick Replies":
-        await show_quick_replies(update, context)
-        return
-    if text == "📊 Status":
-        await status(update, context)
-        return
-    if text == "❓ Help":
-        await help_command(update, context)
-        return
-
-    partner_id = get_partner_id(user_id, data)
-    if not partner_id:
-        await update.message.reply_text(
-            "You're not connected to anyone. Use /start to pair with someone."
+            "⏳ The admin hasn't started the bot yet. Ask @" + ADMIN_USERNAME + " to open the bot first."
         )
         return
 
-    name = update.effective_user.first_name or "Partner"
-
-    try:
-        msg = update.message
-        pid = int(partner_id)
-
-        if msg.text:
-            await context.bot.send_message(
-                chat_id=pid,
-                text=f"💬 *{name}:*\n{msg.text}",
-                parse_mode="Markdown",
-            )
-        elif msg.photo:
-            await context.bot.send_photo(
-                chat_id=pid,
-                photo=msg.photo[-1].file_id,
-                caption=f"📷 *{name}*" + (f"\n{msg.caption}" if msg.caption else ""),
-                parse_mode="Markdown",
-            )
-        elif msg.voice:
-            await context.bot.send_voice(
-                chat_id=pid,
-                voice=msg.voice.file_id,
-                caption=f"🎤 *{name}*",
-                parse_mode="Markdown",
-            )
-        elif msg.video:
-            await context.bot.send_video(
-                chat_id=pid,
-                video=msg.video.file_id,
-                caption=f"🎥 *{name}*" + (f"\n{msg.caption}" if msg.caption else ""),
-                parse_mode="Markdown",
-            )
-        elif msg.video_note:
-            await context.bot.send_video_note(chat_id=pid, video_note=msg.video_note.file_id)
-        elif msg.document:
-            await context.bot.send_document(
-                chat_id=pid,
-                document=msg.document.file_id,
-                caption=f"📎 *{name}*" + (f"\n{msg.caption}" if msg.caption else ""),
-                parse_mode="Markdown",
-            )
-        elif msg.sticker:
-            await context.bot.send_sticker(chat_id=pid, sticker=msg.sticker.file_id)
-        elif msg.audio:
-            await context.bot.send_audio(
-                chat_id=pid,
-                audio=msg.audio.file_id,
-                caption=f"🎵 *{name}*" + (f"\n{msg.caption}" if msg.caption else ""),
-                parse_mode="Markdown",
-            )
-        elif msg.location:
-            await context.bot.send_message(chat_id=pid, text=f"📍 *{name}* shared a location", parse_mode="Markdown")
-            await context.bot.send_location(chat_id=pid, latitude=msg.location.latitude, longitude=msg.location.longitude)
-        else:
-            await update.message.reply_text("⚠️ This message type isn't supported yet.")
-            return
-
-    except Exception as e:
-        logger.error(f"Relay failed: {e}")
-        await update.message.reply_text(
-            "⚠️ Message could not be delivered. Your partner may have blocked the bot."
-        )
-
-
-# ── Quick replies ─────────────────────────────────────────────────────────────
-
-async def show_quick_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if not get_partner_id(user_id, load_data()):
-        await update.message.reply_text("You need to be connected to use quick replies.")
-        return
-    await update.message.reply_text(
-        "⚡ *Quick Replies* — tap to send:",
-        parse_mode="Markdown",
-        reply_markup=quick_replies_inline(),
-    )
-
-
-async def handle_quick_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "qr_cancel":
-        await query.edit_message_text("Cancelled.")
-        return
-
-    index = int(query.data.split("_")[1])
-    _, message = QUICK_REPLIES[index]
-
-    user_id = str(query.from_user.id)
-    data = load_data()
-    partner_id = get_partner_id(user_id, data)
-    if not partner_id:
-        await query.edit_message_text("You're not connected to anyone.")
-        return
-
-    name = query.from_user.first_name or "Partner"
-    await context.bot.send_message(
-        chat_id=int(partner_id),
-        text=f"💬 *{name}:*\n{message}",
-        parse_mode="Markdown",
-    )
-    await query.edit_message_text(f"✓ Sent: _{message}_", parse_mode="Markdown")
-
-
-# ── /status ───────────────────────────────────────────────────────────────────
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    partner_id = get_partner_id(user_id, load_data())
-
-    if partner_id:
-        try:
-            partner = await context.bot.get_chat(int(partner_id))
-            name = partner.first_name or "your partner"
-            text = f"📊 *Status*\n\n✅ Connected to *{name}*\n\nUse /disconnect to unpair."
-        except Exception:
-            text = "📊 *Status*\n\n✅ Connected\n\nUse /disconnect to unpair."
-    else:
-        text = "📊 *Status*\n\n❌ Not connected\n\nUse /start to pair with someone."
-
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard())
-
-
-# ── /disconnect ───────────────────────────────────────────────────────────────
-
-async def disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = load_data()
-    partner_id = get_partner_id(user_id, data)
-
-    if not partner_id:
-        await update.message.reply_text("You're not connected to anyone.")
-        return
-
-    data["pairs"].pop(user_id, None)
-    data["pairs"].pop(str(partner_id), None)
-    save_data(data)
-
-    await update.message.reply_text(
-        "🔌 *Disconnected.*\n\nUse /start to connect again.",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    name  = e(user.first_name or user.username or "Someone")
+    uname = f"@{user.username}" if user.username else f"(ID: {user.id})"
     try:
         await context.bot.send_message(
-            chat_id=int(partner_id),
-            text="🔌 *Your partner has disconnected.*\n\nUse /start to connect with someone new.",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
+            chat_id=admin_id,
+            text=f"🔔 <b>Access request</b>\n\n{name} ({uname}) wants to chat.\n\nApprove or deny:",
+            parse_mode="HTML",
+            reply_markup=approve_kb(user.id),
         )
-    except Exception:
-        pass
+        await update.message.reply_text(
+            "⏳ Approval request sent to the admin. You'll be notified when approved.",
+            parse_mode="HTML",
+        )
+    except Exception as ex:
+        logger.error(f"Admin notify failed: {ex}")
+        await update.message.reply_text("⚠️ Could not reach the admin right now. Try again later.")
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
+# ── Approve / Deny button ──────────────────────────────────────────────────────
+
+async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user):
+        await query.answer("Only the admin can do this.", show_alert=True)
+        return
+
+    action, uid_str = query.data.split("_", 1)
+    uid = int(uid_str)
+
+    if action == "approve":
+        state["approved"]   = True
+        state["allowed_id"] = uid
+        await query.edit_message_text("✅ Access <b>approved.</b>", parse_mode="HTML")
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="✅ <b>Approved!</b> You can now chat — just send a message!",
+                parse_mode="HTML", reply_markup=main_kb(),
+            )
+        except Exception as ex:
+            logger.error(f"Could not notify allowed user: {ex}")
+    else:
+        state["approved"] = False
+        await query.edit_message_text("❌ Access <b>denied.</b>", parse_mode="HTML")
+        try:
+            await context.bot.send_message(chat_id=uid, text="❌ Your access request was denied.")
+        except Exception:
+            pass
+
+
+# ── /approve  /revoke ──────────────────────────────────────────────────────────
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    state["approved"] = True
+    await update.message.reply_text(f"✅ @{ALLOWED_USERNAME} is approved.")
+    if state["allowed_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=state["allowed_id"],
+                text="✅ <b>Access granted!</b> You can now send messages.",
+                parse_mode="HTML", reply_markup=main_kb(),
+            )
+        except Exception: pass
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    state["approved"] = False
+    await update.message.reply_text(f"🔒 @{ALLOWED_USERNAME}'s access revoked.")
+    if state["allowed_id"]:
+        try:
+            await context.bot.send_message(
+                chat_id=state["allowed_id"],
+                text="🔒 Your access has been revoked.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception: pass
+
+
+# ── /status ────────────────────────────────────────────────────────────────────
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_auth(user): return
+    if is_admin(user):
+        st = "✅ Approved" if state["approved"] else "❌ Not approved"
+        text = (
+            f"📊 <b>Admin Status</b>\n\n"
+            f"@{ALLOWED_USERNAME}: {st}\n"
+            f"/approve — grant  |  /revoke — remove"
+        )
+    else:
+        text = "📊 ✅ Approved — you can chat." if state["approved"] else "📊 ⏳ Waiting for admin approval."
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_kb())
+
+
+# ── /help ──────────────────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_auth(user): return
+    admin_part = (
+        f"\n<b>Admin commands:</b>\n"
+        f"/approve — grant access to @{ALLOWED_USERNAME}\n"
+        f"/revoke  — remove access\n"
+    ) if is_admin(user) else ""
     await update.message.reply_text(
-        "❓ *Updates — Help*\n\n"
-        "*Commands:*\n"
-        "/start — Pair with someone\n"
-        "/status — Check your connection\n"
-        "/disconnect — Unpair from your partner\n"
-        "/help — Show this message\n\n"
-        "*Supported content:*\n"
-        "Text, photos, videos, voice messages, video notes, files, stickers, audio, locations\n\n"
-        "⚡ *Quick Replies* — send preset messages with one tap\n\n"
-        "_All messages are private and only sent to your paired partner._",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
+        "❓ <b>Help</b>\n\n"
+        "/start — Start / request access\n"
+        "/status — Check status\n"
+        "/help — This message\n"
+        + admin_part +
+        "\n<b>Supports:</b> text, photos, videos, voice, files, stickers, locations\n\n"
+        "<i>Messages are private — only between admin and approved user.</i>",
+        parse_mode="HTML", reply_markup=main_kb(),
     )
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Message relay ──────────────────────────────────────────────────────────────
+
+async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_auth(user):
+        await update.message.reply_text("⛔ You are not authorised to use this bot.")
+        return
+
+    register(user)
+
+    text = update.message.text or ""
+    if text == "📊 Status": await status(update, context); return
+    if text == "❓ Help":   await help_command(update, context); return
+
+    if is_allowed(user) and not state["approved"]:
+        await update.message.reply_text("⏳ You're not approved yet. Use /start to request access.")
+        return
+
+    partner_id = state["allowed_id"] if is_admin(user) else state["admin_id"]
+    if not partner_id:
+        await update.message.reply_text("⚠️ Partner hasn't started the bot yet.")
+        return
+
+    qr_map = {lbl: msg for lbl, msg in QUICK_REPLIES}
+    if text in qr_map:
+        name = e(user.first_name or "Partner")
+        ts   = fmt_time(update.message.date)
+        await context.bot.send_message(
+            chat_id=partner_id,
+            text=f"💬 <b>{name}:</b>\n{e(qr_map[text])}\n\n{ts}", parse_mode="HTML",
+        )
+        await update.message.reply_text(f"✓ Sent: <i>{e(qr_map[text])}</i>", parse_mode="HTML")
+        return
+
+    msg   = update.message
+    name  = e(user.first_name or "Partner")
+    ts    = fmt_time(msg.date)
+    quote = fmt_quote(msg.reply_to_message)
+
+    try:
+        if msg.text:
+            await context.bot.send_message(
+                chat_id=partner_id,
+                text=f"💬 <b>{name}:</b>\n{quote}{e(msg.text)}\n\n{ts}", parse_mode="HTML",
+            )
+        elif msg.photo:
+            cap = f"📷 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
+            await context.bot.send_photo(chat_id=partner_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
+        elif msg.voice:
+            await context.bot.send_voice(chat_id=partner_id, voice=msg.voice.file_id,
+                caption=f"🎤 <b>{name}</b>\n{quote}\n{ts}", parse_mode="HTML")
+        elif msg.video:
+            cap = f"🎥 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
+            await context.bot.send_video(chat_id=partner_id, video=msg.video.file_id, caption=cap, parse_mode="HTML")
+        elif msg.video_note:
+            await context.bot.send_video_note(chat_id=partner_id, video_note=msg.video_note.file_id)
+            await context.bot.send_message(chat_id=partner_id, text=f"🎥 <b>{name}</b>\n{quote}{ts}", parse_mode="HTML")
+        elif msg.document:
+            cap = f"📎 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
+            await context.bot.send_document(chat_id=partner_id, document=msg.document.file_id, caption=cap, parse_mode="HTML")
+        elif msg.sticker:
+            await context.bot.send_sticker(chat_id=partner_id, sticker=msg.sticker.file_id)
+            await context.bot.send_message(chat_id=partner_id, text=f"<b>{name}</b>\n{quote}{ts}", parse_mode="HTML")
+        elif msg.audio:
+            cap = f"🎵 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
+            await context.bot.send_audio(chat_id=partner_id, audio=msg.audio.file_id, caption=cap, parse_mode="HTML")
+        elif msg.location:
+            await context.bot.send_message(chat_id=partner_id,
+                text=f"📍 <b>{name}</b> shared a location\n{quote}\n{ts}", parse_mode="HTML")
+            await context.bot.send_location(chat_id=partner_id,
+                latitude=msg.location.latitude, longitude=msg.location.longitude)
+        else:
+            await update.message.reply_text("⚠️ This message type isn't supported yet.")
+    except Exception as ex:
+        logger.error(f"Relay error: {ex}")
+        await update.message.reply_text(f"⚠️ Could not deliver. Error: {ex}")
+
+
+# ── Edit relay ─────────────────────────────────────────────────────────────────
+
+async def relay_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_auth(user): return
+    if is_allowed(user) and not state["approved"]: return
+    partner_id = state["allowed_id"] if is_admin(user) else state["admin_id"]
+    if not partner_id: return
+    msg = update.edited_message
+    if not msg or not msg.text: return
+    name = e(user.first_name or "Partner")
+    ts   = fmt_time(msg.edit_date or msg.date)
+    await context.bot.send_message(
+        chat_id=partner_id,
+        text=f"✏️ <b>{name}</b> edited:\n{e(msg.text)}\n\n{ts}", parse_mode="HTML",
+    )
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TOKEN).build()
-
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(handle_enter_code_button, pattern="^enter_code$")],
-        states={ENTER_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_code)]},
-        fallbacks=[CommandHandler("start", start)],
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("disconnect", disconnect))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_gen_code, pattern="^gen_code$"))
-    app.add_handler(CallbackQueryHandler(handle_quick_reply, pattern="^qr_"))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay_message))
-
-    logger.info("Updates Bot is running...")
-    app.run_polling(drop_pending_updates=True)
-
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("status",  status))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("revoke",  cmd_revoke))
+    app.add_handler(CommandHandler("help",    help_command))
+    app.add_handler(CallbackQueryHandler(on_approval, pattern="^(approve|deny)_"))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, relay_edit))
+    logger.info("Bot running...")
+    app.run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
