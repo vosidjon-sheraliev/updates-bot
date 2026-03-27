@@ -95,8 +95,8 @@ def e(text: str) -> str:
     return html.escape(str(text))
 
 def fmt_time(dt: datetime) -> str:
-    local = dt.astimezone(timezone.utc)
-    return f"<i>📅 {local.strftime('%A, %d %b')}</i>"
+    local = dt.astimezone(TASHKENT)
+    return f"<i>📅 {local.strftime('%A, %d %b · %H:%M')}</i>"
 
 def fmt_quote(reply_msg) -> str:
     if not reply_msg:
