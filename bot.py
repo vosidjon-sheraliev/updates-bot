@@ -103,15 +103,15 @@ def fmt_quote(reply_msg) -> str:
         return ""
     if reply_msg.text:
         preview = reply_msg.text[:60] + ("…" if len(reply_msg.text) > 60 else "")
-        return f"┊ <i>{e(preview)}</i>\n"
-    elif reply_msg.photo:       return "┊ <i>📷 Photo</i>\n"
-    elif reply_msg.voice:       return "┊ <i>🎤 Voice message</i>\n"
-    elif reply_msg.video:       return "┊ <i>🎥 Video</i>\n"
-    elif reply_msg.video_note:  return "┊ <i>🎥 Video note</i>\n"
-    elif reply_msg.document:    return "┊ <i>📎 File</i>\n"
-    elif reply_msg.sticker:     return f"┊ <i>{reply_msg.sticker.emoji} Sticker</i>\n" if reply_msg.sticker.emoji else "┊ <i>Sticker</i>\n"
-    elif reply_msg.audio:       return "┊ <i>🎵 Audio</i>\n"
-    elif reply_msg.location:    return "┊ <i>📍 Location</i>\n"
+        return f"┊ <i>{e(preview)}</i>\n\n"
+    elif reply_msg.photo:       return "┊ <i>📷 Photo</i>\n\n"
+    elif reply_msg.voice:       return "┊ <i>🎤 Voice message</i>\n\n"
+    elif reply_msg.video:       return "┊ <i>🎥 Video</i>\n\n"
+    elif reply_msg.video_note:  return "┊ <i>🎥 Video note</i>\n\n"
+    elif reply_msg.document:    return "┊ <i>📎 File</i>\n\n"
+    elif reply_msg.sticker:     return f"┊ <i>{reply_msg.sticker.emoji} Sticker</i>\n\n" if reply_msg.sticker.emoji else "┊ <i>Sticker</i>\n\n"
+    elif reply_msg.audio:       return "┊ <i>🎵 Audio</i>\n\n"
+    elif reply_msg.location:    return "┊ <i>📍 Location</i>\n\n"
     return ""
 
 def username_of(user) -> str:
@@ -441,7 +441,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         owner_id,
-                        f"📤 <b>Agent → {label}</b>\n{e(actual_text)}\n{ts}",
+                        f"📤 <b>Agent → {label}</b>\n\n{e(actual_text)}\n\n{ts}",
                         parse_mode="HTML",
                     )
                 except Exception: pass
@@ -482,7 +482,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     owner_id,
-                    f"📤 <b>Agent → {label}</b>\n{preview}\n{ts}",
+                    f"📤 <b>Agent → {label}</b>\n\n{preview}\n\n{ts}",
                     parse_mode="HTML",
                 )
             except Exception: pass
@@ -552,7 +552,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 owner_id,
-                f"📥 <b>{name} → Agent</b>\n{preview}\n{ts}",
+                f"📥 <b>{name} → Agent</b>\n\n{preview}\n\n{ts}",
                 parse_mode="HTML",
             )
         except Exception: pass
