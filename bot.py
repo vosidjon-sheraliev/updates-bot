@@ -431,17 +431,17 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not client_fully_approved(client_uid):
                 await msg.reply_text("⚠️ That person is no longer active.")
                 return
-            ts    = fmt_time(msg.date)
             label = e(client_label(client_uid))
             actual_text = QUICK_MAP[text]
             await context.bot.send_message(client_uid, actual_text)
             await msg.reply_text(f"✓ Sent to {label}: <i>{e(actual_text)}</i>", parse_mode="HTML")
             owner_id = state["owner_id"]
             if owner_id:
+                ts = fmt_time(msg.date)
                 try:
                     await context.bot.send_message(
                         owner_id,
-                        f"📤 <b>Agent → {label}</b>\n{e(actual_text)}\n\n{ts}",
+                        f"📤 <b>Agent → {label}</b>\n{e(actual_text)}\n{ts}",
                         parse_mode="HTML",
                     )
                 except Exception: pass
@@ -464,25 +464,25 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("⚠️ That person is no longer active.")
             return
 
-        ts    = fmt_time(msg.date)
         label = e(client_label(client_uid))
         quote = fmt_quote(msg.reply_to_message)
 
         try:
-            await _send_content(context, msg, client_uid, header=quote or None, ts=ts)
+            await _send_content(context, msg, client_uid, header=quote or None, ts=None)
         except Exception as ex:
             await msg.reply_text(f"⚠️ Could not deliver: {ex}"); return
 
         await msg.reply_text(f"✓ Delivered to {label}")
 
-        # Silent copy to owner
+        # Silent copy to owner (with full detail)
         owner_id = state["owner_id"]
         if owner_id:
+            ts = fmt_time(msg.date)
             preview = e(text) if text else "[media]"
             try:
                 await context.bot.send_message(
                     owner_id,
-                    f"📤 <b>Agent → {label}</b>\n{preview}\n\n{ts}",
+                    f"📤 <b>Agent → {label}</b>\n{preview}\n{ts}",
                     parse_mode="HTML",
                 )
             except Exception: pass
@@ -529,15 +529,14 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     name  = e(user.first_name or user.username or "Someone")
-    ts    = fmt_time(msg.date)
     quote = fmt_quote(msg.reply_to_message)
 
-    # Forward to agent; store sent message_id for reply routing
+    # Forward to agent (no date — clean view)
     try:
         sent = await _send_content(
             context, msg, agent_id,
             header=f"💬 <b>{name}:</b>\n{quote}",
-            ts=ts,
+            ts=None,
         )
         if sent:
             msg_map[sent.message_id] = user.id
@@ -545,14 +544,15 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Relay to agent failed: {ex}")
         await msg.reply_text("⚠️ Could not reach the agent right now."); return
 
-    # Silent copy to owner
+    # Silent copy to owner (full detail)
     owner_id = state["owner_id"]
     if owner_id:
+        ts = fmt_time(msg.date)
         preview = e(text) if text else "[media]"
         try:
             await context.bot.send_message(
                 owner_id,
-                f"📥 <b>{name} → Agent</b>\n{preview}\n\n{ts}",
+                f"📥 <b>{name} → Agent</b>\n{preview}\n{ts}",
                 parse_mode="HTML",
             )
         except Exception: pass
