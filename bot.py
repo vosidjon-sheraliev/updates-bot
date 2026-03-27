@@ -138,7 +138,7 @@ def agent_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def owner_kb() -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton("📋 People"), KeyboardButton("📊 Status")]]
+    rows = [[KeyboardButton("👥 Manage"), KeyboardButton("📊 Status")]]
     btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
     for i in range(0, len(btns), 2):
         rows.append(btns[i:i+2])
@@ -321,34 +321,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception: pass
             return
 
-        # Agent approved
+        # Agent approved — grant access immediately, just notify owner
         client["agent_approved"] = True
+        client["owner_approved"] = True
         save_state()
-        await query.edit_message_text(
-            f"✅ You approved <b>{label}</b>.\n<i>Waiting for final confirmation…</i>",
-            parse_mode="HTML",
-        )
-        # Ask owner for final approval
+        await query.edit_message_text(f"✅ You approved <b>{label}</b>.", parse_mode="HTML")
+        await _grant_access(context, uid)
         owner_id = state["owner_id"]
         if owner_id:
             try:
                 await context.bot.send_message(
                     owner_id,
-                    f"📋 Agent approved <b>{label}</b>.\n\nGive final approval?",
+                    f"✅ Farangis approved <b>{label}</b> — they now have access.",
                     parse_mode="HTML",
-                    reply_markup=owner_decision_kb(uid),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔒 Revoke", callback_data=f"ow_revoke_{uid}"),
+                    ]]),
                 )
             except Exception as ex:
-                logger.error(f"Owner final approval notify failed: {ex}")
-        else:
-            # No owner — auto-grant
-            client["owner_approved"] = True
-            save_state()
-            await _grant_access(context, uid)
+                logger.error(f"Owner notify failed: {ex}")
         return
 
     # ── Owner decision ──
     if who == "ow":
+        if action == "revoke":
+            if client:
+                client["agent_approved"] = False
+                client["owner_approved"] = False
+                save_state()
+            await query.edit_message_text(f"🔒 Revoked access for <b>{label}</b>.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(uid, "🔒 Your access has been revoked.")
+            except Exception: pass
+            agent_id = state["agent_id"]
+            if agent_id:
+                try:
+                    await context.bot.send_message(agent_id, f"🔒 <b>{label}</b> has been removed.", parse_mode="HTML")
+                except Exception: pass
+            return
+
         if action == "deny":
             state["clients"].pop(uid_str, None)
             save_state()
@@ -479,17 +490,17 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await msg.reply_text(f"✓ Delivered to {label}")
 
-        # Silent copy to owner (with full detail)
+        # Silent copy to owner — actual media forwarded
         owner_id = state["owner_id"]
         if owner_id:
             ts = fmt_time(msg.date)
-            preview = e(text) if text else "[media]"
             try:
                 await context.bot.send_message(
                     owner_id,
-                    f"📤 <b>Agent → {label}</b>\n\n{preview}\n\n{ts}",
+                    f"📤 <b>Agent → {label}</b>\n{ts}",
                     parse_mode="HTML",
                 )
+                await _send_content(context, msg, owner_id, header=None, ts=None)
             except Exception: pass
         return
 
@@ -498,7 +509,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not state["owner_id"]:
             state["owner_id"] = user.id
             save_state()
-        if text == "📋 People": await cmd_clients(update, context); return
+        if text == "👥 Manage":  await cmd_clients(update, context); return
         if text == "📊 Status":  await cmd_status(update, context); return
 
         # Quick reply → send to agent
@@ -528,26 +539,17 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Always forward to owner — even if not approved
     _owner_id = state["owner_id"]
     if _owner_id:
-        uname    = f"@{user.username}" if user.username else f"ID:{user.id}"
-        _name    = e(user.first_name or user.username or "Someone")
-        _ts      = fmt_time(msg.date)
-        _preview = e(msg.text) if msg.text else (
-            "📷 Photo" if msg.photo else
-            "🎤 Voice" if msg.voice else
-            "🎥 Video" if msg.video else
-            "📎 File"  if msg.document else
-            "🎵 Audio" if msg.audio else
-            "📍 Location" if msg.location else
-            "🎥 Video note" if msg.video_note else
-            "Sticker" if msg.sticker else "[message]"
-        )
-        _status = "✅ approved" if client_fully_approved(user.id) else "⏳ not approved"
+        uname   = f"@{user.username}" if user.username else f"ID:{user.id}"
+        _name   = e(user.first_name or user.username or "Someone")
+        _ts     = fmt_time(msg.date)
+        _status = "✅" if client_fully_approved(user.id) else "⏳ not approved"
         try:
             await context.bot.send_message(
                 _owner_id,
-                f"👁 <b>{_name}</b> ({e(uname)}) [{_status}]\n\n{_preview}\n\n{_ts}",
+                f"👁 <b>{_name}</b> ({e(uname)}) {_status}\n{_ts}",
                 parse_mode="HTML",
             )
+            await _send_content(context, msg, _owner_id, header=None, ts=None)
         except Exception: pass
 
     if not client_fully_approved(user.id):
@@ -575,17 +577,17 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Relay to agent failed: {ex}")
         await msg.reply_text("⚠️ Could not reach the agent right now."); return
 
-    # Silent copy to owner (full detail)
+    # Silent copy to owner — actual media forwarded
     owner_id = state["owner_id"]
     if owner_id:
         ts = fmt_time(msg.date)
-        preview = e(text) if text else "[media]"
         try:
             await context.bot.send_message(
                 owner_id,
-                f"📥 <b>{name} → Agent</b>\n\n{preview}\n\n{ts}",
+                f"📥 <b>{name} → Agent</b>\n{ts}",
                 parse_mode="HTML",
             )
+            await _send_content(context, msg, owner_id, header=None, ts=None)
         except Exception: pass
 
 
@@ -651,12 +653,25 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML", reply_markup=kb,
             )
     else:
-        lines = ["📋 <b>People</b>\n"]
+        # Owner view — each person with revoke/approve buttons
         for uid_str, c in clients.items():
-            icon  = "✅" if (c.get("agent_approved") and c.get("owner_approved")) else "⏳"
-            uname = f" @{c['username']}" if c.get("username") else ""
-            lines.append(f"{icon} {e(c.get('name','?'))}{e(uname)}")
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            uid      = int(uid_str)
+            name     = c.get("name", "?")
+            uname    = f" @{c['username']}" if c.get("username") else ""
+            approved = c.get("agent_approved") and c.get("owner_approved")
+            if approved:
+                kb   = InlineKeyboardMarkup([[InlineKeyboardButton("🔒 Revoke", callback_data=f"ow_revoke_{uid}")]])
+                icon = "✅"
+            else:
+                kb   = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ow_approve_{uid}"),
+                    InlineKeyboardButton("❌ Remove",  callback_data=f"ow_deny_{uid}"),
+                ]])
+                icon = "⏳"
+            await update.message.reply_text(
+                f"{icon} <b>{e(name)}</b>{e(uname)}",
+                parse_mode="HTML", reply_markup=kb,
+            )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -706,7 +721,7 @@ def main():
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("clients", cmd_clients))
     app.add_handler(CommandHandler("help",    help_command))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny)_|^settarget_"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny|revoke)_|^settarget_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
     logger.info("Bot running…")
     app.run_polling(drop_pending_updates=False)
