@@ -95,11 +95,24 @@ def e(text: str) -> str:
     return html.escape(str(text))
 
 def fmt_time(dt: datetime) -> str:
-    local = dt.astimezone(TASHKENT)
-    now   = datetime.now(TASHKENT)
-    if local.date() == now.date():
-        return f"<i>⏱ {local.strftime('%H:%M')}</i>"
-    return f"<i>⏱ {local.strftime('%d %b %H:%M')}</i>"
+    local = dt.astimezone(timezone.utc)
+    return f"<i>📅 {local.strftime('%A, %d %b')}</i>"
+
+def fmt_quote(reply_msg) -> str:
+    if not reply_msg:
+        return ""
+    if reply_msg.text:
+        preview = reply_msg.text[:60] + ("…" if len(reply_msg.text) > 60 else "")
+        return f"┊ <i>{e(preview)}</i>\n"
+    elif reply_msg.photo:       return "┊ <i>📷 Photo</i>\n"
+    elif reply_msg.voice:       return "┊ <i>🎤 Voice message</i>\n"
+    elif reply_msg.video:       return "┊ <i>🎥 Video</i>\n"
+    elif reply_msg.video_note:  return "┊ <i>🎥 Video note</i>\n"
+    elif reply_msg.document:    return "┊ <i>📎 File</i>\n"
+    elif reply_msg.sticker:     return f"┊ <i>{reply_msg.sticker.emoji} Sticker</i>\n" if reply_msg.sticker.emoji else "┊ <i>Sticker</i>\n"
+    elif reply_msg.audio:       return "┊ <i>🎵 Audio</i>\n"
+    elif reply_msg.location:    return "┊ <i>📍 Location</i>\n"
+    return ""
 
 def username_of(user) -> str:
     return (user.username or "").lower()
@@ -453,9 +466,10 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ts    = fmt_time(msg.date)
         label = e(client_label(client_uid))
+        quote = fmt_quote(msg.reply_to_message)
 
         try:
-            await _send_content(context, msg, client_uid, header=None, ts=ts)
+            await _send_content(context, msg, client_uid, header=quote or None, ts=ts)
         except Exception as ex:
             await msg.reply_text(f"⚠️ Could not deliver: {ex}"); return
 
@@ -516,12 +530,13 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name  = e(user.first_name or user.username or "Someone")
     ts    = fmt_time(msg.date)
+    quote = fmt_quote(msg.reply_to_message)
 
     # Forward to agent; store sent message_id for reply routing
     try:
         sent = await _send_content(
             context, msg, agent_id,
-            header=f"💬 <b>{name}:</b>\n",
+            header=f"💬 <b>{name}:</b>\n{quote}",
             ts=ts,
         )
         if sent:
