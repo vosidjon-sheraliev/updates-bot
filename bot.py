@@ -470,7 +470,12 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await _send_content(context, msg, client_uid, header=quote or None, ts=None)
         except Exception as ex:
-            await msg.reply_text(f"⚠️ Could not deliver: {ex}"); return
+            err = str(ex).lower()
+            if "blocked" in err or "forbidden" in err:
+                await msg.reply_text("⚠️ Can't send — this person has blocked the bot or hasn't started it yet. Ask them to open the bot and send /start.")
+            else:
+                await msg.reply_text(f"⚠️ Could not deliver: {ex}")
+            return
 
         await msg.reply_text(f"✓ Delivered to {label}")
 
