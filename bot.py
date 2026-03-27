@@ -519,6 +519,32 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Client sending a message ──
+
+    # Always forward to owner — even if not approved
+    _owner_id = state["owner_id"]
+    if _owner_id:
+        uname    = f"@{user.username}" if user.username else f"ID:{user.id}"
+        _name    = e(user.first_name or user.username or "Someone")
+        _ts      = fmt_time(msg.date)
+        _preview = e(msg.text) if msg.text else (
+            "📷 Photo" if msg.photo else
+            "🎤 Voice" if msg.voice else
+            "🎥 Video" if msg.video else
+            "📎 File"  if msg.document else
+            "🎵 Audio" if msg.audio else
+            "📍 Location" if msg.location else
+            "🎥 Video note" if msg.video_note else
+            "Sticker" if msg.sticker else "[message]"
+        )
+        _status = "✅ approved" if client_fully_approved(user.id) else "⏳ not approved"
+        try:
+            await context.bot.send_message(
+                _owner_id,
+                f"👁 <b>{_name}</b> ({e(uname)}) [{_status}]\n\n{_preview}\n\n{_ts}",
+                parse_mode="HTML",
+            )
+        except Exception: pass
+
     if not client_fully_approved(user.id):
         await msg.reply_text("⏳ You don't have access yet. Use /start to request.")
         return
