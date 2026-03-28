@@ -11,9 +11,11 @@ import html
 import json
 import logging
 import os
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -755,6 +757,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def _start_health_server():
+    """Tiny HTTP server so Render keeps the service alive."""
+    port = int(os.getenv("PORT", 8000))
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
+
 def main():
     load_state()
     logger.info(
@@ -762,6 +773,7 @@ def main():
         f"agent={state['agent_id']}, "
         f"clients={len(state['clients'])}"
     )
+    threading.Thread(target=_start_health_server, daemon=True).start()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("status",  cmd_status))
