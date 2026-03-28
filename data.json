@@ -1,13 +1,6 @@
 {
   "owner_id": 5659030626,
   "agent_id": 1206601311,
-  "clients": {
-    "7451090338": {
-      "name": "i'theeu",
-      "username": "itheeu",
-      "agent_approved": false,
-      "owner_approved": false
-    }
-  },
+  "clients": {},
   "agent_target": 5659030626
 }
