@@ -590,7 +590,8 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Regular typed message → send to agent
         if agent_id:
             try:
-                await _send_content(context, msg, agent_id, header=None, ts=None)
+                quote = fmt_quote(msg.reply_to_message)
+                await _send_content(context, msg, agent_id, header=quote or None, ts=None)
             except Exception as ex:
                 await msg.reply_text(f"⚠️ Could not send: {ex}")
         else:
