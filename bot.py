@@ -187,7 +187,7 @@ def client_label(uid: int) -> str:
     return f"{name}{uname}"
 
 def agent_kb() -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton("📋 People"), KeyboardButton("📩 Boss"), KeyboardButton("❓ Help")]]
+    rows = [[KeyboardButton("📋 People"), KeyboardButton("📩 Vosidjon"), KeyboardButton("❓ Help")]]
     btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
     for i in range(0, len(btns), 2):
         rows.append(btns[i:i+2])
@@ -476,7 +476,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "📋 People": await cmd_clients(update, context); return
         if text == "❓ Help":    await help_command(update, context); return
-        if text == "📩 Boss":
+        if text == "📩 Vosidjon":
             owner_id = state["owner_id"]
             if not owner_id:
                 await msg.reply_text("⚠️ Vosidjon hasn't started the bot yet.")
