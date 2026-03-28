@@ -37,7 +37,7 @@ TOKEN          = os.getenv("BOT_TOKEN")
 OWNER_USERNAME = os.getenv("ADMIN_USERNAME",   "vosidjonn").lstrip("@").lower()
 AGENT_USERNAME = os.getenv("ALLOWED_USERNAME", "farangis_f23").lstrip("@").lower()
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data.json")
+DATA_FILE = os.path.join(os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__))), "data.json")
 
 state = {
     "owner_id":     None,
