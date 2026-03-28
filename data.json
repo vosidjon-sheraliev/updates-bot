@@ -1,13 +1,6 @@
 {
   "owner_id": 5659030626,
   "agent_id": 1206601311,
-  "clients": {
-    "5951224475": {
-      "name": "Won Vosidjon",
-      "username": "vosidjonu",
-      "agent_approved": true,
-      "owner_approved": true
-    }
-  },
+  "clients": {},
   "agent_target": 5659030626
 }
