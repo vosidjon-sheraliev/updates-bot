@@ -6,10 +6,13 @@ Updates Bot — Business relay
   everyone else  : clients (must be approved by agent, then by owner)
 """
 
+import base64
 import html
 import json
 import logging
 import os
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import (
@@ -36,6 +39,10 @@ logger = logging.getLogger(__name__)
 TOKEN          = os.getenv("BOT_TOKEN")
 OWNER_USERNAME = os.getenv("ADMIN_USERNAME",   "vosidjonn").lstrip("@").lower()
 AGENT_USERNAME = os.getenv("ALLOWED_USERNAME", "farangis_f23").lstrip("@").lower()
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO  = os.getenv("GITHUB_REPO", "vosidjon-sheraliev/updates-bot")
+GITHUB_FILE  = "data.json"
 
 DATA_FILE = os.path.join(os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__))), "data.json")
 
@@ -66,27 +73,74 @@ QUICK_MAP = {lbl: txt for lbl, txt in QUICK_REPLIES}
 
 # ── Persistence ────────────────────────────────────────────────────────────────
 
+def _github_request(method: str, data: bytes = None):
+    """GET or PUT data.json on GitHub."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+def _apply_saved(saved: dict):
+    state["owner_id"]     = saved.get("owner_id")
+    state["agent_id"]     = saved.get("agent_id")
+    state["clients"]      = saved.get("clients", {})
+    state["agent_target"] = saved.get("agent_target")
+
 def load_state():
+    # Try GitHub first (works on any cloud host)
+    if GITHUB_TOKEN:
+        try:
+            data = _github_request("GET")
+            content = base64.b64decode(data["content"]).decode()
+            _apply_saved(json.loads(content))
+            logger.info("State loaded from GitHub.")
+            return
+        except Exception as ex:
+            logger.warning(f"GitHub load failed, falling back to file: {ex}")
+    # Fallback: local file
     try:
         with open(DATA_FILE, "r") as f:
-            saved = json.load(f)
-        # migrate old single-user format
-        if "admin_id" in saved and "owner_id" not in saved:
-            state["owner_id"]     = saved.get("admin_id")
-            state["agent_id"]     = saved.get("allowed_id")
-            state["clients"]      = {}
-            state["agent_target"] = None
-        else:
-            state["owner_id"]     = saved.get("owner_id")
-            state["agent_id"]     = saved.get("agent_id")
-            state["clients"]      = saved.get("clients", {})
-            state["agent_target"] = saved.get("agent_target")
+            _apply_saved(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
+# Cache the GitHub file SHA so we can update (not just create) the file
+_github_sha: str | None = None
+
 def save_state():
-    with open(DATA_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    global _github_sha
+    payload = json.dumps(state, indent=2)
+    # Always write local file
+    try:
+        with open(DATA_FILE, "w") as f:
+            f.write(payload)
+    except Exception: pass
+    # Push to GitHub if token available
+    if GITHUB_TOKEN:
+        try:
+            if not _github_sha:
+                try:
+                    info = _github_request("GET")
+                    _github_sha = info.get("sha")
+                except Exception:
+                    _github_sha = None
+            body: dict = {
+                "message": "state update",
+                "content": base64.b64encode(payload.encode()).decode(),
+            }
+            if _github_sha:
+                body["sha"] = _github_sha
+            result = _github_request("PUT", json.dumps(body).encode())
+            _github_sha = result.get("content", {}).get("sha")
+        except Exception as ex:
+            logger.warning(f"GitHub save failed: {ex}")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
