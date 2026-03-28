@@ -116,15 +116,13 @@ def load_state():
 # Cache the GitHub file SHA so we can update (not just create) the file
 _github_sha: str | None = None
 
-def save_state():
+def _save_state_sync():
     global _github_sha
     payload = json.dumps(state, indent=2)
-    # Always write local file
     try:
         with open(DATA_FILE, "w") as f:
             f.write(payload)
     except Exception: pass
-    # Push to GitHub if token available
     if GITHUB_TOKEN:
         try:
             if not _github_sha:
@@ -143,6 +141,9 @@ def save_state():
             _github_sha = result.get("content", {}).get("sha")
         except Exception as ex:
             logger.warning(f"GitHub save failed: {ex}")
+
+def save_state():
+    threading.Thread(target=_save_state_sync, daemon=True).start()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -592,19 +593,19 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Client sending a message ──
 
-    # Always forward to owner — even if not approved
     _owner_id = state["owner_id"]
-    if _owner_id:
-        uname   = f"@{user.username}" if user.username else f"ID:{user.id}"
-        _name   = e(user.first_name or user.username or "Someone")
-        _ts     = fmt_time(msg.date)
-        _status = "✅" if client_fully_approved(user.id) else "⏳ not approved"
-        try:
-            await _send_content(context, msg, _owner_id,
-                                header=f"👁 <b>{_name}</b> ({e(uname)}) {_status} {_ts}\n\n", ts=None)
-        except Exception: pass
+    uname     = f"@{user.username}" if user.username else f"ID:{user.id}"
+    _name     = e(user.first_name or user.username or "Someone")
+    _ts       = fmt_time(msg.date)
+    approved  = client_fully_approved(user.id)
 
-    if not client_fully_approved(user.id):
+    if not approved:
+        # Forward unapproved message to owner only
+        if _owner_id:
+            try:
+                await _send_content(context, msg, _owner_id,
+                                    header=f"👁 <b>{_name}</b> ({e(uname)}) ⏳ not approved {_ts}\n\n", ts=None)
+            except Exception: pass
         await msg.reply_text("⏳ You don't have access yet. Use /start to request.")
         return
 
@@ -613,14 +614,13 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Agent is not available right now. Try later.")
         return
 
-    name  = e(user.first_name or user.username or "Someone")
     quote = fmt_quote(msg.reply_to_message)
 
     # Forward to agent (no date — clean view)
     try:
         sent = await _send_content(
             context, msg, agent_id,
-            header=f"💬 <b>{name}:</b>\n{quote}",
+            header=f"💬 <b>{_name}:</b>\n{quote}",
             ts=None,
         )
         if sent:
@@ -629,13 +629,11 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Relay to agent failed: {ex}")
         await msg.reply_text("⚠️ Could not reach the agent right now."); return
 
-    # Silent copy to owner — actual media forwarded
-    owner_id = state["owner_id"]
-    if owner_id:
-        ts = fmt_time(msg.date)
+    # Single copy to owner — one message, with label
+    if _owner_id:
         try:
-            await _send_content(context, msg, owner_id,
-                                header=f"📥 <b>{name} → Agent</b> {ts}\n\n", ts=None)
+            await _send_content(context, msg, _owner_id,
+                                header=f"💬 <b>{_name}</b> ({e(uname)}) {_ts}\n\n", ts=None)
         except Exception: pass
 
 
@@ -654,16 +652,21 @@ async def _send_content(context, msg, target_id: int, header: str | None, ts: st
         cap = h + (e(msg.caption) if msg.caption else "") + ts_line
         return await context.bot.send_photo(target_id, msg.photo[-1].file_id, caption=cap, parse_mode="HTML")
     elif msg.voice:
-        return await context.bot.send_voice(target_id, msg.voice.file_id)
+        cap = h + (e(msg.caption) if msg.caption else "") + ts_line
+        return await context.bot.send_voice(target_id, msg.voice.file_id, caption=cap or None, parse_mode="HTML")
     elif msg.video:
         cap = h + (e(msg.caption) if msg.caption else "") + ts_line
         return await context.bot.send_video(target_id, msg.video.file_id, caption=cap, parse_mode="HTML")
     elif msg.video_note:
+        if h:
+            await context.bot.send_message(target_id, h.rstrip(), parse_mode="HTML")
         return await context.bot.send_video_note(target_id, msg.video_note.file_id)
     elif msg.document:
         cap = h + (e(msg.caption) if msg.caption else "") + ts_line
         return await context.bot.send_document(target_id, msg.document.file_id, caption=cap, parse_mode="HTML")
     elif msg.sticker:
+        if h:
+            await context.bot.send_message(target_id, h.rstrip(), parse_mode="HTML")
         return await context.bot.send_sticker(target_id, msg.sticker.file_id)
     elif msg.audio:
         cap = h + (e(msg.caption) if msg.caption else "") + ts_line
