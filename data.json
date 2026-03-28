@@ -5,8 +5,8 @@
     "7451090338": {
       "name": "i'theeu",
       "username": "itheeu",
-      "agent_approved": false,
-      "owner_approved": false
+      "agent_approved": true,
+      "owner_approved": true
     }
   },
   "agent_target": 5659030626
