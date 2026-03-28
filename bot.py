@@ -187,7 +187,7 @@ def client_label(uid: int) -> str:
     return f"{name}{uname}"
 
 def agent_kb() -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton("📋 People"), KeyboardButton("❓ Help")]]
+    rows = [[KeyboardButton("📋 People"), KeyboardButton("📩 Boss"), KeyboardButton("❓ Help")]]
     btns = [KeyboardButton(lbl) for lbl, _ in QUICK_REPLIES]
     for i in range(0, len(btns), 2):
         rows.append(btns[i:i+2])
@@ -476,6 +476,15 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "📋 People": await cmd_clients(update, context); return
         if text == "❓ Help":    await help_command(update, context); return
+        if text == "📩 Boss":
+            owner_id = state["owner_id"]
+            if not owner_id:
+                await msg.reply_text("⚠️ Boss hasn't started the bot yet.")
+                return
+            state["agent_target"] = owner_id
+            save_state()
+            await msg.reply_text("🟢 <b>Boss</b> is now your active chat. Just type to send.", parse_mode="HTML")
+            return
 
         # Quick reply button — needs a target client via reply
         if text in QUICK_MAP:
@@ -487,10 +496,11 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 return
-            if not client_fully_approved(client_uid):
+            is_target_owner = (client_uid == state["owner_id"])
+            if not is_target_owner and not client_fully_approved(client_uid):
                 await msg.reply_text("⚠️ That person is no longer active.")
                 return
-            label = e(client_label(client_uid))
+            label = "Boss" if is_target_owner else e(client_label(client_uid))
             actual_text = QUICK_MAP[text]
             await context.bot.send_message(client_uid, actual_text)
             await msg.reply_text(f"✓ Sent to {label}: <i>{e(actual_text)}</i>", parse_mode="HTML")
@@ -519,28 +529,30 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if not client_fully_approved(client_uid):
+        is_target_owner = (client_uid == state["owner_id"])
+        if not is_target_owner and not client_fully_approved(client_uid):
             await msg.reply_text("⚠️ That person is no longer active.")
             return
 
-        label = e(client_label(client_uid))
+        label = "Boss" if is_target_owner else e(client_label(client_uid))
         quote = fmt_quote(msg.reply_to_message)
 
+        header = f"📩 <b>Farangis:</b>\n{quote}" if is_target_owner else (quote or None)
         try:
-            await _send_content(context, msg, client_uid, header=quote or None, ts=None)
+            await _send_content(context, msg, client_uid, header=header, ts=None)
         except Exception as ex:
             err = str(ex).lower()
             if "blocked" in err or "forbidden" in err:
-                await msg.reply_text("⚠️ Can't send — this person has blocked the bot or hasn't started it yet. Ask them to open the bot and send /start.")
+                await msg.reply_text("⚠️ Can't send — this person has blocked the bot or hasn't started it yet.")
             else:
                 await msg.reply_text(f"⚠️ Could not deliver: {ex}")
             return
 
         await msg.reply_text(f"✓ Delivered to {label}")
 
-        # Silent copy to owner — actual media forwarded
+        # Silent copy to owner (only if target is NOT already the owner)
         owner_id = state["owner_id"]
-        if owner_id:
+        if owner_id and not is_target_owner:
             ts = fmt_time(msg.date)
             try:
                 await context.bot.send_message(
