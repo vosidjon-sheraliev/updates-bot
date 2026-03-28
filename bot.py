@@ -185,8 +185,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state()
         await update.message.reply_text(
             "👋 <b>Welcome!</b>\n\n"
-            "Just send a message to get started.\n\n"
-            "<b>To reply to someone:</b> tap-hold their message → Reply, then type.\n"
+            "When someone requests access you'll get approve/deny buttons.\n\n"
+            "<b>To reply:</b> tap-hold their message → Reply, then type.\n"
             "Or tap 📋 People to choose who to talk to.",
             parse_mode="HTML", reply_markup=agent_kb(),
         )
@@ -218,7 +218,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_state()
 
-    # Notify owner only — with approve/deny buttons
+    agent_id = state["agent_id"]
+    if not agent_id:
+        await update.message.reply_text("⏳ Not available yet. Try again later.")
+        return
+
+    # Notify Farangis — with approve/deny buttons
+    try:
+        await context.bot.send_message(
+            chat_id=agent_id,
+            text=(
+                f"🔔 <b>New request</b>\n\n"
+                f"{e(name)} ({e(uname)}) wants to connect."
+            ),
+            parse_mode="HTML",
+            reply_markup=agent_decision_kb(user.id),
+        )
+    except Exception as ex:
+        logger.error(f"Agent notify failed: {ex}")
+
+    # Notify owner — info only, no buttons
     owner_id = state["owner_id"]
     if owner_id:
         try:
@@ -226,16 +245,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=owner_id,
                 text=(
                     f"🔔 <b>New request</b>\n\n"
-                    f"{e(name)} ({e(uname)}) wants to connect."
+                    f"{e(name)} ({e(uname)}) wants to connect.\n"
+                    f"<i>Waiting for Farangis to decide.</i>"
                 ),
                 parse_mode="HTML",
-                reply_markup=owner_decision_kb(user.id),
             )
         except Exception as ex:
             logger.error(f"Owner notify failed: {ex}")
-    else:
-        await update.message.reply_text("⏳ Not available yet. Try again later.")
-        return
 
     await update.message.reply_text("⏳ Request sent. You'll be notified once approved.")
 
@@ -269,7 +285,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid    = int(parts[2])
     uid_str = str(uid)
 
-    if who != "ow" or not is_owner(from_user):
+    if who == "ag" and not is_agent(from_user):
+        await query.answer("Not authorised.", show_alert=True); return
+    if who == "ow" and not is_owner(from_user):
         await query.answer("Not authorised.", show_alert=True); return
 
     client = state["clients"].get(uid_str)
@@ -278,7 +296,52 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label = e(client_label(uid))
 
-    # ── Owner decision ──
+    # ── Farangis decides ──
+    if who == "ag":
+        if action == "deny":
+            del state["clients"][uid_str]
+            save_state()
+            await query.edit_message_text(f"❌ You denied <b>{label}</b>.", parse_mode="HTML")
+            try:
+                await context.bot.send_message(uid, "❌ Your access request was denied.")
+            except Exception: pass
+            # Inform owner — offer override
+            owner_id = state["owner_id"]
+            if owner_id:
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        f"❌ Farangis denied <b>{label}</b>.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Approve anyway", callback_data=f"ow_approve_{uid}"),
+                        ]]),
+                    )
+                except Exception: pass
+            return
+
+        # Farangis approved — grant access immediately
+        client["agent_approved"] = True
+        client["owner_approved"] = True
+        save_state()
+        await query.edit_message_text(f"✅ You approved <b>{label}</b>.", parse_mode="HTML")
+        await _grant_access(context, uid)
+        # Inform owner — offer revoke
+        owner_id = state["owner_id"]
+        if owner_id:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"✅ Farangis approved <b>{label}</b> — they now have access.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔒 Revoke", callback_data=f"ow_revoke_{uid}"),
+                    ]]),
+                )
+            except Exception: pass
+        return
+
+    # ── Owner manages ──
     if who == "ow":
         if action == "revoke":
             if client:
@@ -650,7 +713,7 @@ def main():
     app.add_handler(CommandHandler("status",  cmd_status))
     app.add_handler(CommandHandler("clients", cmd_clients))
     app.add_handler(CommandHandler("help",    help_command))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^ow_(approve|deny|revoke)_|^settarget_"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny|revoke)_|^settarget_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
     logger.info("Bot running…")
     app.run_polling(drop_pending_updates=False)
