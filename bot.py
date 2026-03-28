@@ -778,18 +778,9 @@ def _start_health_server():
         def log_message(self, *a): pass
     HTTPServer(("0.0.0.0", port), H).serve_forever()
 
-def main():
-    load_state()
-    logger.info(
-        f"Loaded: owner={state['owner_id']}, "
-        f"agent={state['agent_id']}, "
-        f"clients={len(state['clients'])}"
-    )
-    threading.Thread(target=_start_health_server, daemon=True).start()
-
+def _build_app():
     async def error_handler(update, context):
         logger.warning(f"Ignored error: {context.error}")
-
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("status",  cmd_status))
@@ -798,8 +789,23 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny|revoke)_|^settarget_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
     app.add_error_handler(error_handler)
-    logger.info("Bot running…")
-    app.run_polling(drop_pending_updates=False)
+    return app
+
+def main():
+    load_state()
+    logger.info(f"Loaded: owner={state['owner_id']}, agent={state['agent_id']}, clients={len(state['clients'])}")
+    threading.Thread(target=_start_health_server, daemon=True).start()
+    while True:
+        try:
+            logger.info("Bot starting…")
+            _build_app().run_polling(drop_pending_updates=False)
+            logger.info("Bot stopped, restarting in 2s…")
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down.")
+            break
+        except Exception as e:
+            logger.error(f"Crash: {e}, restarting in 2s…")
+        import time; time.sleep(2)
 
 if __name__ == "__main__":
     main()
