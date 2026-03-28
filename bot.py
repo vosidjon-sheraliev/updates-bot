@@ -531,7 +531,12 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         is_target_owner = (client_uid == state["owner_id"])
         if not is_target_owner and not client_fully_approved(client_uid):
-            await msg.reply_text("⚠️ That person is no longer active.")
+            state["agent_target"] = None
+            save_state()
+            await msg.reply_text(
+                "⚠️ No active chat. Tap <b>📋 People</b> to choose someone, or tap <b>📩 Vosidjon</b> to message Vosidjon.",
+                parse_mode="HTML",
+            )
             return
 
         label = "Vosidjon" if is_target_owner else e(client_label(client_uid))
