@@ -479,11 +479,11 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📩 Boss":
             owner_id = state["owner_id"]
             if not owner_id:
-                await msg.reply_text("⚠️ Boss hasn't started the bot yet.")
+                await msg.reply_text("⚠️ Vosidjon hasn't started the bot yet.")
                 return
             state["agent_target"] = owner_id
             save_state()
-            await msg.reply_text("🟢 <b>Boss</b> is now your active chat. Just type to send.", parse_mode="HTML")
+            await msg.reply_text("🟢 <b>Vosidjon</b> is now your active chat. Just type to send.", parse_mode="HTML")
             return
 
         # Quick reply button — needs a target client via reply
@@ -500,7 +500,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_target_owner and not client_fully_approved(client_uid):
                 await msg.reply_text("⚠️ That person is no longer active.")
                 return
-            label = "Boss" if is_target_owner else e(client_label(client_uid))
+            label = "Vosidjon" if is_target_owner else e(client_label(client_uid))
             actual_text = QUICK_MAP[text]
             await context.bot.send_message(client_uid, actual_text)
             await msg.reply_text(f"✓ Sent to {label}: <i>{e(actual_text)}</i>", parse_mode="HTML")
@@ -534,10 +534,10 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("⚠️ That person is no longer active.")
             return
 
-        label = "Boss" if is_target_owner else e(client_label(client_uid))
+        label = "Vosidjon" if is_target_owner else e(client_label(client_uid))
         quote = fmt_quote(msg.reply_to_message)
 
-        header = f"📩 <b>Farangis:</b>\n{quote}" if is_target_owner else (quote or None)
+        header = f"📩 <b>Farangis:</b>\n{quote or ''}" if is_target_owner else (quote or None)
         try:
             await _send_content(context, msg, client_uid, header=header, ts=None)
         except Exception as ex:
