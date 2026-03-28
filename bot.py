@@ -115,32 +115,38 @@ def load_state():
 
 # Cache the GitHub file SHA so we can update (not just create) the file
 _github_sha: str | None = None
+_save_lock = threading.Lock()
 
 def _save_state_sync():
     global _github_sha
-    payload = json.dumps(state, indent=2)
+    if not _save_lock.acquire(blocking=False):
+        return  # save already in progress, skip
     try:
-        with open(DATA_FILE, "w") as f:
-            f.write(payload)
-    except Exception: pass
-    if GITHUB_TOKEN:
+        payload = json.dumps(state, indent=2)
         try:
-            if not _github_sha:
-                try:
-                    info = _github_request("GET")
-                    _github_sha = info.get("sha")
-                except Exception:
-                    _github_sha = None
-            body: dict = {
-                "message": "state update",
-                "content": base64.b64encode(payload.encode()).decode(),
-            }
-            if _github_sha:
-                body["sha"] = _github_sha
-            result = _github_request("PUT", json.dumps(body).encode())
-            _github_sha = result.get("content", {}).get("sha")
-        except Exception as ex:
-            logger.warning(f"GitHub save failed: {ex}")
+            with open(DATA_FILE, "w") as f:
+                f.write(payload)
+        except Exception: pass
+        if GITHUB_TOKEN:
+            try:
+                if not _github_sha:
+                    try:
+                        info = _github_request("GET")
+                        _github_sha = info.get("sha")
+                    except Exception:
+                        _github_sha = None
+                body: dict = {
+                    "message": "state update",
+                    "content": base64.b64encode(payload.encode()).decode(),
+                }
+                if _github_sha:
+                    body["sha"] = _github_sha
+                result = _github_request("PUT", json.dumps(body).encode())
+                _github_sha = result.get("content", {}).get("sha")
+            except Exception as ex:
+                logger.warning(f"GitHub save failed: {ex}")
+    finally:
+        _save_lock.release()
 
 def save_state():
     threading.Thread(target=_save_state_sync, daemon=True).start()
