@@ -779,6 +779,10 @@ def main():
         f"clients={len(state['clients'])}"
     )
     threading.Thread(target=_start_health_server, daemon=True).start()
+
+    async def error_handler(update, context):
+        logger.warning(f"Ignored error: {context.error}")
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("status",  cmd_status))
@@ -786,6 +790,7 @@ def main():
     app.add_handler(CommandHandler("help",    help_command))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(ag|ow)_(approve|deny|revoke)_|^settarget_"))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, relay))
+    app.add_error_handler(error_handler)
     logger.info("Bot running…")
     app.run_polling(drop_pending_updates=False)
 
