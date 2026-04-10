@@ -769,6 +769,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _start_health_server():
     """Tiny HTTP server so Render keeps the service alive."""
+    import time
     port = int(os.getenv("PORT", 8000))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -776,7 +777,12 @@ def _start_health_server():
         def do_HEAD(self):
             self.send_response(200); self.end_headers()
         def log_message(self, *a): pass
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
+    while True:
+        try:
+            HTTPServer(("0.0.0.0", port), H).serve_forever()
+        except Exception as ex:
+            logger.warning(f"Health server crash: {ex}, restarting in 1s…")
+            time.sleep(1)
 
 def _build_app():
     async def error_handler(update, context):
