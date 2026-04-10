@@ -797,26 +797,12 @@ def _build_app():
     app.add_error_handler(error_handler)
     return app
 
-async def _run_bot():
-    app = _build_app()
-    await app.run_polling(drop_pending_updates=False)
-
 def main():
-    import asyncio, time
     load_state()
     logger.info(f"Loaded: owner={state['owner_id']}, agent={state['agent_id']}, clients={len(state['clients'])}")
     threading.Thread(target=_start_health_server, daemon=True).start()
-    while True:
-        try:
-            logger.info("Bot starting…")
-            asyncio.run(_run_bot())   # fresh event loop every time — no "loop is closed" crash
-            logger.info("Bot stopped, restarting in 2s…")
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Shutting down.")
-            break
-        except Exception as e:
-            logger.error(f"Crash: {e}, restarting in 2s…")
-        time.sleep(2)
+    logger.info("Bot starting…")
+    _build_app().run_polling(drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
