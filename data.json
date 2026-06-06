@@ -7,6 +7,12 @@
       "username": "itheeu",
       "agent_approved": true,
       "owner_approved": true
+    },
+    "5769729636": {
+      "name": "Ethan",
+      "username": "",
+      "agent_approved": false,
+      "owner_approved": false
     }
   },
   "agent_target": 5659030626
