@@ -11,8 +11,8 @@
     "5659030626": {
       "name": "Vosidjon",
       "username": "",
-      "agent_approved": false,
-      "owner_approved": false
+      "agent_approved": true,
+      "owner_approved": true
     }
   },
   "agent_target": 5659030626
