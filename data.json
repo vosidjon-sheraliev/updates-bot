@@ -19,6 +19,12 @@
       "username": "",
       "agent_approved": true,
       "owner_approved": true
+    },
+    "5951224475": {
+      "name": "Vosidjon",
+      "username": "vosidjon_sh",
+      "agent_approved": false,
+      "owner_approved": false
     }
   },
   "agent_target": 5659030626
